@@ -1,0 +1,13 @@
+PySide6>=6.7
+numpy>=1.26
+soundfile>=0.12
+mutagen>=1.47
+requests>=2.31
+torch>=2.2
+transformers>=4.44
+
+# Optional extras (the app degrades gracefully without them):
+#   openl3 + TensorFlow   -> enables the OpenL3 embedding plugin
+#     pip install openl3 tensorflow
+#   ffmpeg (system binary) -> enables AAC/APE decoding + rich probing.
+#     A static build ships in ./bin (ffmpeg, ffprobe); alternatively: brew install ffmpeg
