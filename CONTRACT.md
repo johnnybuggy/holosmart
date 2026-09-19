@@ -4,8 +4,89 @@ Single source of truth for all modules. **Read this fully before writing code.**
 Files already written by the orchestrator (do NOT modify, implement against them):
 `app/config.py`, `app/models/base.py`, `app/db/schema.sql`.
 
+## Player + results-copy addenda (implemented)
+
+* **Built-in player** (`app/ui/player.py`, `PlayerBar`): lazy
+  `QMediaPlayer` + `QAudioOutput`; environments without the backend get a
+  disabled bar, never a crash. `play_chunk(path, start, end)` seeks to the
+  chunk start and pauses at the chunk end (`_on_position` enforcement;
+  bounded state `_chunk_end_ms`). `DetailPane.chunk_play_requested(str,
+  float, float)` is emitted when the Chunks tab's column-0 cell is clicked
+  (`cellClicked`, per-row ranges cached in `_refresh_chunks` as
+  `_chunks_ranges` + `_chunks_track_path`); `MainWindow` forwards it to
+  the `PlayerBar` docked under the splitter. Re-clicking the SAME file
+  must apply the new seek immediately (no fresh `mediaStatusChanged`).
+* **"Copy files…"** (`DetailPane._on_copy_results`): `QFileDialog` folder
+  picker; dedups result paths (`_result_paths`); `shutil.copy2`; identical
+  size at target → skip, differing collision → `name (2).ext` rename;
+  missing sources count as failed; summary in the Similar status line +
+  one `QMessageBox`. Button enabled iff results exist.
+
+## Roster v4 addenda (implemented)
+
+* **Roster v4 — LP-MusicCaps (`lpmc`), Qwen2-Audio (`qwen2audio`)**
+  (`app/models/lpmusiccaps_model.py`, `app/models/qwen2audio_model.py`,
+  vendored port `app/models/vendor/lpmc_bart.py`; registered between
+  muqlan and openl3; canonical order: clap, mert, mert330, m2dclap, muq,
+  muqlan, lpmc, qwen2audio, openl3, fft):
+  LP-MusicCaps = 768-d mel-CNN embeddings + beam-5 CAPTIONS stored as
+  chunk tags (16 kHz, 10 s windows, checkpoint `transfer.pth` ~1.8 GB
+  fetched once from HF `seungheondoh/lp-music-caps`; the upstream pip
+  package/repo cannot install on Python 3.14, so the two model files
+  are vendored with attribution); Qwen2-Audio = 1280-d Whisper-tower
+  embeddings (16 kHz, exact 30 s windows — the tower enforces 3000 mel
+  frames; `Qwen2AudioEncoder` is loaded directly so the 16.8 GB text
+  LLM never enters memory; bf16 on MPS). One-time auto-enable via
+  `models_version` 4 (same bump-after-migration rule). Settings gains
+  LP-MusicCaps / Qwen2-Audio pages.
+  **Verified NOT shippable**: Audio Flamingo 2 (no transformers class,
+  no config.json/code in the HF repo, non-commercial checkpoints,
+  ~37 GB fp32 CUDA research code), SALMONN (pinned torch 2.0.1 /
+  transformers 4.28.0 / py3.9, CUDA-only, dead BEATs link), LTU
+  (vendored patched transformers, torch 1.13.1, no LICENSE file).
+  `tag score` display = `log10(score)` rounded to 2 decimals (chunks
+  Tags column + the double-click all-tags dialog).
+* **Noise pipeline rework** (`app/similarity/noise_filter.py`,
+  `app/ui/workers.py`, `app/ui/detail_pane.py`): REAL HDBSCAN/OPTICS
+  labels + a reachability cross-check (two-factor rule,
+  `NOISE_REACH_FACTOR = 2.0`); `MIN_NOISE_VECTORS = 20` +
+  `AnalysisWorker._post_run_noise_clustering` re-fits both methods for
+  every covered model after EVERY analysis run; Chunks-tab tinting is
+  unconditional (HDBSCAN amber / OPTICS blue / both pink); the
+  HDBSCAN/OPTICS checkboxes moved to the Similar tab (discard-from-
+  searches only). Double-clicking any NON-model cell of the Chunks
+  table opens a dialog with ALL of the chunk's tags (log10 scores).
+* **Visualisation click-to-play**: `ScatterCanvas.point_clicked(int)`
+  (nearest-point pick within `_PICK_RADIUS` on left-click);
+  `VisualisationDialog.play_track_path_requested(str)` maps the plotted
+  index back to its track path (`_point_keys`); MainWindow opens the
+  file in the system player (`_on_play_path`).
+* **File tree sizing**: `_MODEL_COLUMN_MIN_WIDTH` and the compression
+  pass are gone — per-model columns keep content width, horizontal
+  scrollbar when the roster overflows; name column keeps the leftover
+  width with a 120 px floor. The main splitter can travel right: the
+  tabs pane carries an explicit 340 px minimum width that overrides its
+  wide layout-driven `minimumSizeHint` (Similar-tab controls row), and
+  extra window width flows to the tabs pane (`setStretchFactor`).
+
 ## v1.1 addenda (implemented)
 
+* **Roster v3 — M2D-CLAP, MuQ, MuQ-MuLan** (`app/models/m2dclap_model.py`,
+  `app/models/muq_model.py`, registered between mert330 and openl3 in
+  canonical order — see *Roster v4* below for the current full order):
+  M2D-CLAP = 768-d audio-language embeddings + zero-shot tags (NTT, 16 kHz;
+  runtime + ~1.5 GB weights fetched from the pinned v0.5.0 release into
+  `<data>/models/m2d/` — NO vendored NTT code because of the non-commercial
+  evaluation license); MuQ = 1024-d SSL music embeddings (24 kHz, `pip
+  install muq`); MuQ-MuLan = 512-d joint music-text embeddings + zero-shot
+  tags (24 kHz, 10 s windows). One-time auto-enable via `models_version` 3
+  (load() also bumps the in-memory version after a migration so a later
+  save cannot re-run it over a user's opt-out). `similarity/search.py
+  _MODEL_ORDER` ('auto' preference) includes the three new keys; Settings
+  gains M2D-CLAP / MuQ / MuQ-MuLan pages (tag editors for the two taggers).
+  Per-model columns keep their natural content width; when the roster is
+  wider than the pane the tree shows a horizontal scrollbar instead of
+  compressing columns (see *Roster v4*).
 * New model plugin **fft** (`app/models/fft_model.py`, registered last in
   `app.models.registry`): FFT spectral band statistics per chunk — 6 band
   stats x 6 bands (0-50, 50-300, 300-1000, 1000-5000, 5000-15000,
@@ -15,10 +96,23 @@ Files already written by the orchestrator (do NOT modify, implement against them
   (default 10 s), one-time auto-enable for legacy configs via
   `models_version`.
 * File tree shows one status column per registered plugin (column 0 name,
-  column 1 overall status, columns 2.. per-model ✓/✗ and per-folder
-  percentage-only progress cells — `ready/total` counts live in the cell
-  tooltips); column 0 auto-sizes to fit filenames plus
-  their nesting depth.
+  columns 1.. per-model ✓/✗ and per-folder percentage-only progress cells —
+  `ready/total` counts live in the cell tooltips). There is NO overall
+  Status column: a track's overall state rides on its column-0 tooltip
+  (second line; `PATH_ROLE` carries the raw path for highlight/reveal).
+  A model with zero analysis coverage in the library has its column
+  HIDDEN (recomputed per refresh(); `update_track_status` re-reveals it
+  in place when the first results arrive); `_autosize_name_column` sizes
+  and compresses only visible columns, and the header's last-section
+  stretch is off (column 0 is the stretch column by design).
+* The main window starts at the primary screen's `availableGeometry()`
+  (desktop area minus menu bar/Dock) — as large as possible but a normal,
+  non-maximized, resizable window.
+* The Similar tab's reference list is compact (2x2 button grid, list max
+  height 64px, group box Maximum vertical size policy). `Clear` empties
+  the list and SUPPRESSES the auto-fill for the currently selected track
+  (`_cleared_track_id`); it resumes when the tree selection changes or
+  the user edits the list manually.
 * `repo.get_track_embedding_counts` / `repo.get_all_track_embedding_counts`
   feed the per-model tree columns; `pipeline.aggregate_description` is
   public for reuse. (The v1.1 per-file tag editor was removed in v1.3 —
@@ -153,13 +247,43 @@ Files already written by the orchestrator (do NOT modify, implement against them
   L2-normalized (the app's cosine space) and scored with HDBSCAN's
   mutual-reachability density or OPTICS' ordering reachability
   (`DENSITY_NEIGHBORS = 4`); a chunk is noise when its score exceeds
-  `NOISE_REACH_FACTOR = 4` x its own song's median score — label-based
-  noise (`labels_ < 0`) is not used because tiny point clouds fragment.
-  Tracks with fewer than `MIN_TRACK_CHUNKS = 6` chunks are skipped.
-  Global caps 200 000 (HDBSCAN) / 100 000 (OPTICS) vectors per run; a
+  The REAL scikit-learn algorithms, per song: HDBSCAN
+  (`min_cluster_size = max(3, min(5, n-2))`, `min_samples = 1`) and
+  OPTICS (extracted DBSCAN-style via `cluster_optics_dbscan` at 2x the
+  song's median k-NN distance; requires `core_distances=` in sklearn
+  1.9).  A chunk is noise when its label is `-1` **AND** its mean
+  k-NN distance (`DENSITY_NEIGHBORS = 4` neighbors) exceeds
+  `NOISE_REACH_FACTOR = 2.0` x its song's median — the two-factor rule
+  absorbs the algorithms' degenerate false positives inside perfectly
+  tight per-song blobs (sklearn HDBSCAN marks arbitrary points of a
+  near-duplicate blob as -1).  Tracks with fewer than
+  `MIN_TRACK_CHUNKS = 6` chunks are skipped.
+  Global caps 1 000 000 (both methods) vectors per run; a
   fit of a 5k-track library takes ~30 s per method, and `progress_cb`
   receives `(message, fraction)` for a real progress bar. Stored
-  params: `{"scope": "per-track", ...}`. Runs are one-time and cached.
+  params: `{"scope": "per-track", "algorithm": <method>, ...}`. Runs
+  are one-time and cached; `MIN_NOISE_VECTORS = 20` gates every fit.
+  **Nothing runs automatically after analysis** —
+  `AnalysisWorker._post_run_normalization` only re-standardizes FFT
+  vectors.  Clustering is BUTTON-driven: the Chunks tab's **"Find
+  outliers"** button starts `NoiseSweepWorker`, which calls
+  `fit_noise_filter_pending(datasets)` — for every model dataset with
+  chunk vectors, ONLY the pending songs are judged via
+  `fit_noise_filter_tracks` (flags are per song, so other songs' stored
+  flags stay valid; the filter row is updated in place with
+  `repo.update_noise_filter_result`).  Pending = no row in the
+  `noise_run_tracks` bookkeeping table (per (dataset, method,
+  track_id): chunk count + chunk-id sum) or a changed signature
+  (newly analyzed tracks, re-analyzed tracks with new chunk ids);
+  `repo.pending_noise_tracks` does the comparison.  Full fits record
+  bookkeeping for every clustered track (`fit_noise_filter` and
+  `fit_noise_filter_tracks` both call `record_noise_run_tracks`), so a
+  sweep after a full fit is a no-op.  A FULL-library refit of one
+  dataset stays available through the checkbox-triggered
+  `NoiseFilterWorker` (`fit_noise_filter`).
+  Chunks-tab tinting is UNCONDITIONAL (no checkbox gates it); the two
+  checkboxes now live on the Similar tab and only decide whether noise
+  is discarded from searches.
   `similar_tracks(..., discard_noise=("hdbscan", "optics"))` drops flagged
   chunks before every algorithm — vector loaders
   (`pareto._dataset_chunk_vectors`, `pareto._chunk_vectors_by_model`,
@@ -360,7 +484,8 @@ unittest), scikit-learn (t-SNE in the Visualisation dialog is optional,
    codec, sample rate, channels, bit depth, bitrate, duration + tags.
 3. Analysis decodes each track and splits it into chunks: `chunk_seconds` (default
    20.0) with `overlap_percent` (default 50 → hop = 10 s).
-4. Chunks are embedded by enabled model plugins (default list: clap, mert, openl3);
+4. Chunks are embedded by enabled model plugins (default list: clap, mert, openl3,
+   fft, m2dclap, muq, muqlan);
    per-chunk vectors stored in `embeddings`, human-readable tags in `chunk_tags`.
 5. Chunk results are grouped under their track in the UI (Chunks tab: one row per
    chunk with its tags and per-model embedding previews).
@@ -505,6 +630,48 @@ class Mert330Plugin(MertPlugin):  # name='mert330', display_name='MERT-330M', di
     # default_model_id='m-a-p/MERT-v1-330M', settings_prefix='mert330', BATCH_SIZE=4.
     # A separate PLUGIN KEY (not just a model id) so 1024-d vectors never share the
     # 'mert' key with 768-d ones; opt-in via Settings (not auto-enabled).
+
+class M2dClapPlugin(ModelPlugin): # name='m2dclap', display_name='M2D-CLAP', dim 768,
+    # provides_text=True, preferred_sample_rate=16000,
+    # requirements=('torch','timm','einops','nnaudio','transformers')
+    # NTT M2D-CLAP (IEEE Access 2025, m2d_clap_vit_base-80x1001p16x16p16kpBpTI-2025):
+    # NO vendored NTT code (non-commercial evaluation license). _load bootstraps
+    #   <data>/models/m2d/: downloads the official portable_m2d.py (raw.githubusercontent,
+    #   pinned v0.5.0 tag) + the ~1.5 GB release zip, unzips, imports the runtime via
+    #   importlib, builds PortableM2D(weight_file, flat_features=True) (768-d CLAP path;
+    #   the checkpoint carries its BERT text encoder, 'BpTI'), mps/cpu.
+    # _embed: resample to 16k -> batches zero-padded to max length ->
+    #   model.encode_clap_audio -> L2-normalized vectors.
+    # _describe: zero-shot tags with 'f"{tag} can be heard"' (official Colab template);
+    #   text features cached at load; settings_prefix='m2dclap' (tag_top_k/batch/tags,
+    #   same tag-list-reload semantics as CLAP).
+
+class MuQPlugin(ModelPlugin):     # name='muq', display_name='MuQ', dim 1024,
+    # provides_text=False, preferred_sample_rate=24000,
+    # requirements=('torch','muq','easydict','torchaudio','x_clip') — the muq
+    #   package ships incomplete pip metadata, so its import-time deps are
+    #   gated here too (a missing easydict otherwise crashes mid-analysis).
+    # _load ALSO applies _patch_wav2vec2_easydict_configs: muq 0.1.0 is
+    #   broken under transformers v5 (EasyDict lacks _attn_implementation;
+    #   Wav2Vec2ConformerEncoder no longer returns hidden_states). The shim
+    #   stamps the attribute and rebuilds the v4 hidden_states tuple via
+    #   forward hooks (raw layer outputs + final normed state; [-1] ==
+    #   last_hidden_state). Verified against the real checkpoints.
+    # Tencent MuQ (arXiv 2501.01108) via the 'muq' PyPI package,
+    #   MuQ.from_pretrained('OpenMuQ/MuQ-large-msd-iter'), mps/cpu, fp32 (paper: no
+    #   fp16 — NaN risk). _embed: resample to 24k -> split_windows (window/overlap from
+    #   <muq>_window_sec/_window_overlap_sec) -> batches zero-padded ->
+    #   model(wavs, output_hidden_states=True).last_hidden_state.mean(time) -> pooled per
+    #   chunk, L2-normalized. settings_prefix='muq' (model_id/window/overlap/batch).
+
+class MuQMuLanPlugin(ModelPlugin) # name='muqlan', display_name='MuQ-MuLan', dim 512,
+    # provides_text=True, preferred_sample_rate=24000,
+    # requirements=same-as-muq (see above)
+    # MuQMuLan.from_pretrained('OpenMuQ/MuQ-MuLan-large') — CLIP-like joint music/text
+    #   space (xlm-roberta text tower, EN+ZH captions, clip_secs=10). _embed windows
+    #   chunks at 10 s (1 s overlap) and pools; _describe tags with '"<tag> music."'
+    #   prompts; text features cached at load; settings_prefix='muqlan'
+    #   (model_id/window/overlap/batch/tag_top_k/tags).
 
 class OpenL3Plugin(ModelPlugin):  # name='openl3', display_name='OpenL3', embedding_dim=512,
     # provides_text=False, preferred_sample_rate=48000,

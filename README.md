@@ -2,10 +2,23 @@
 
 A PySide6 desktop application that scans your music folders, catalogs every track in
 SQLite, splits each track into overlapping chunks, runs deep-audio models
-(**CLAP**, **MERT**, **MERT-330M**, **OpenL3**) and a dependency-light **FFT spectral
-statistics** model over the chunks, and lets you browse the per-chunk
+(**CLAP**, **MERT**, **MERT-330M**, **M2D-CLAP**, **MuQ**, **MuQ-MuLan**, **OpenL3**) and a
+dependency-light **FFT spectral statistics** model over the chunks, and lets you browse the per-chunk
 embeddings/tags, find **similar tracks**, generate **playlists** from them,
 and explore the analysis datasets as **scatter plots**.
+
+## Built-in player + results copying
+
+- **Built-in player** — a compact bar under the main window (play/pause,
+  stop, seek, time, volume). **Click a chunk's number in the Chunks tab**
+  and exactly that chunk plays (seek to its start, stop at its end) —
+  double-clicks keep opening the vector/tags dialogs. Playing a whole
+  file via the system player elsewhere is unchanged.
+- **"Copy files…"** (Similar tab, below the playlist buttons) — copies the
+  files of the current search results into a folder you pick: identical
+  copies already there are skipped, colliding differing files get
+  `name (2).ext` names, missing/unreadable sources are counted and
+  reported.
 
 ## Features
 
@@ -17,11 +30,20 @@ and explore the analysis datasets as **scatter plots**.
   yellow. The filename column auto-sizes to the space left over after the
   status area (long names stay reachable via tooltips; drag the splitter
   for more name room), and the tree shows **one status column per analysis
-  model** (Status for overall state, then CLAP, MERT, MERT-330M, OpenL3, FFT, …):
+  model** (CLAP, MERT, MERT-330M, M2D-CLAP, MuQ, MuQ-MuLan, LP-MusicCaps,
+  Qwen2-Audio, OpenL3, FFT, …). Per-model columns keep their natural
+  content width — when the roster is wider than the pane the tree shows a
+  **horizontal scrollbar** instead of squeezing columns (nothing is
+  hidden or elided):
   file rows show a ✓ when that model produced embeddings, a ✗ when the track
   was analyzed but the model produced nothing, and folder/root rows show
   live analysis-progress percentage per model (hover a cell for the exact
-  `ready/total` counts). **Double-click a file to
+  `ready/total` counts). There is **no separate overall Status column** —
+  the per-model columns carry the whole picture (a track's overall state
+  lives on its filename tooltip) — and a model with **zero analysis
+  coverage** in the library has its column hidden entirely, so the visible
+  roster always matches the models actually in use; the column reappears
+  as soon as the first results for it are stored. **Double-click a file to
   play it in the system-wide music player.** Files currently under
   analysis — and every folder above them, up to the library root — are
   highlighted in yellow for the whole duration, and refreshing the tree
@@ -78,7 +100,8 @@ and explore the analysis datasets as **scatter plots**.
   tags and descriptions for the selected file or folder — after a
   confirmation — so the tracks can be re-analyzed from scratch.
 - **Similar tracks** — two pickers, one search. The **Dataset** picker
-  chooses what is compared: `CLAP / MERT / MERT-330M / OpenL3 / FFT` (chunk/centroid
+  chooses what is compared: `CLAP / MERT / MERT-330M / M2D-CLAP / MuQ / MuQ-MuLan /
+  OpenL3 / FFT` (chunk/centroid
   vectors), any stored dimensionality reduction (`red:<id>`, created in the
   *Reduce…* dialog), or `Description (Ollama)` — text embeddings of the
   track descriptions (via a local [Ollama](https://ollama.com) server).
@@ -93,28 +116,40 @@ and explore the analysis datasets as **scatter plots**.
   - **Chamfer** — symmetric mean nearest-chunk distance; EMD and Chamfer
     report the similarity `1 / (1 + distance)`.
   Chunk-level algorithms can also be restricted to a single dataset via the
-  Dataset picker. Two **noise filter** checkboxes (HDBSCAN / OPTICS) live on
-  the **Chunks tab** and drop junk chunks (silence, fades, transitions,
-  spectral flukes) before any comparison. Noise is judged **within each
-  song**: every track's chunks are scored with the selected density method
-  (HDBSCAN mutual reachability / OPTICS ordering reachability) and a chunk
-  is flagged when its score is an outlier relative to its own song (>4x the
-  song's median) — silence in an ambient piece is noise, the same spectrum
-  in a noise-collage track is not. The run is one-time per (dataset,
-  method), cached, fast (~1 minute for a 5k-track library), shown with a
-  real progress bar; every algorithm (including Centroid, whose per-track
-  centroids get recomputed without the noise chunks) then searches over the
-  clean chunk set. With both checkboxes on, a chunk is discarded when
-  either detector flags it. The checkboxes are method toggles — checked
-  means the detector's outliers are active; they never silently reset
-  when the Similar-tab dataset changes. The same checkboxes drive the
-  Chunks-tab highlighting: chunks flagged by HDBSCAN are tinted
-  **amber**, OPTICS outliers **blue**, and chunks flagged by both
-  **pink** (pooling every dataset's stored run of that method), each
-  row's tooltip naming the responsible detector(s). **Double-click a
-  model cell in the chunks grid** to open a read-out of that chunk's
-  full embedding — every dimension with its name (FFT vectors carry
-  their band/stat names, e.g. `1–5 kHz RMS`; other models list `dim N`).
+  Dataset picker. Two **Discard noise** checkboxes (**HDBSCAN / OPTICS**)
+  live on the **Similar tab** and drop junk chunks (silence, fades,
+  transitions, spectral flukes) before any comparison. Noise is judged
+  **within each song** by the REAL density algorithms: every track's
+  chunks are clustered with scikit-learn's **HDBSCAN** and **OPTICS**
+  (OPTICS extracted DBSCAN-style at 2x the song's median k-NN distance),
+  and a chunk is noise when the algorithm leaves it unclustered AND its
+  local reachability is an outlier vs the song's median (the two-factor
+  rule keeps the algorithms' degenerate false positives out; silence in
+  an ambient piece is noise, the same spectrum in a noise-collage track
+  is not). **Nothing runs automatically after analysis** — outlier
+  clustering happens only when you click the Chunks tab's **"Find
+  outliers"** button. That pass is incremental: a song's flags depend
+  only on its own chunks, so only tracks NOT clustered yet (newly
+  analyzed songs, and re-analyzed songs whose chunks changed — tracked
+  per (model, method) via a chunk-count + id-sum signature) are judged,
+  in milliseconds per song; everything else keeps its stored flags. A
+  deliberate full-library refit of one dataset stays available through
+  the Similar tab's checkboxes (~1 minute for a 5k-track library, with
+  a real progress bar).
+  Every algorithm (including Centroid, whose per-track centroids get
+  recomputed without the noise chunks) then searches over the clean
+  chunk set. With both checkboxes on, a chunk is discarded when either
+  detector flags it. The **Chunks-tab highlighting is unconditional**:
+  chunks flagged by HDBSCAN are tinted **amber**, OPTICS outliers
+  **blue**, and chunks flagged by both **pink** (pooling every stored
+  run of that method), each row's tooltip naming the responsible
+  detector(s). **Double-click a model cell in the chunks grid** to open
+  a read-out of that chunk's full embedding — every dimension with its
+  name (FFT vectors carry their band/stat names, e.g. `1–5 kHz RMS`;
+  other models list `dim N`). **Double-click any other cell** (e.g. the
+  Tags column) to open a dialog with **every tag the chunk has** — all
+  models' tags with their scores shown as **log10** (2 decimals, closer
+  to 0 = more confident).
 
   Reductions can age: chunks analyzed (or re-analyzed) after a reduction
   was fitted are missing from its projection. Stale reductions are marked
@@ -138,10 +173,14 @@ and explore the analysis datasets as **scatter plots**.
   **Reference tracks** list: it is auto-filled with the file selected in
   the tree (and follows the selection until you press *Add selected*,
   which pins the list), and *Add selected / Remove / Clear / Add folder…*
-  manage further entries — **Add folder…** adds every track of the folder
+  manage further entries (in a compact 2×2 button grid beside the small
+  list so the results table keeps the space) — **Clear** empties the list
+  and keeps it empty (the selected file is not re-added automatically;
+  picking another file in the tree resumes the auto-fill), **Add folder…**
+  adds every track of the folder
   selected in the tree (a selected file's parent folder counts too; capped
   at 400 tracks). References without vectors in the search dataset are
-  skipped during the search. With **multiple references** the search With **multiple references** the search
+  skipped during the search. With **multiple references** the search
   runs per reference over the untruncated candidate set and combines the
   per-reference match percentages via their **geometric mean** — a track
   must be similar to ALL references to rank high, and the references
@@ -173,7 +212,7 @@ and explore the analysis datasets as **scatter plots**.
   the system music player immediately (single click, no dialogs).
 - **Visualisation** — the toolbar *Visualisation* button opens a scatter-plot
   window over every analyzed chunk. Pick any **component of any model** for
-  the X and Y axes (CLAP, MERT, MERT-330M, OpenL3, FFT — cross-model combinations
+  the X and Y axes (any vector model — cross-model combinations
   allowed; each point is one chunk, hover for track name, chunk index and
   time), or reduce to 2-D first with **PCA** (built-in, instant), **t-SNE**
   (needs `pip install scikit-learn`) or **UMAP** (needs
@@ -186,7 +225,42 @@ and explore the analysis datasets as **scatter plots**.
   method/selection re-plot immediately (debounced 250 ms); t-SNE and UMAP
   wait for an explicit Plot click because they take seconds to minutes.
   Large libraries are subsampled to 50 000 points before drawing, so each
-  re-plot stays snappy.
+  re-plot stays snappy. **Click a dot** to play the audio file under it —
+  the track opens in the system music player right away.
+
+## Analysis models (roster v4)
+
+| Plugin | Key | Embedding | Text | Sample rate | Notes |
+|---|---|---|---|---|---|
+| CLAP | `clap` | 512-d | ✓ zero-shot tags | 48 kHz | LAION CLAP + ~90 music tags |
+| MERT | `mert` | 768-d | — | 24 kHz | m-a-p MERT-v1-95M |
+| MERT-330M | `mert330` | 1024-d | — | 24 kHz | m-a-p MERT-v1-330M |
+| M2D-CLAP | `m2dclap` | 512-d | ✓ zero-shot tags | 16 kHz | NTT (non-commercial ckpt) |
+| MuQ | `muq` | 1024-d | — | 24 kHz | Tencent MuQ-large (msd) |
+| MuQ-MuLan | `muqlan` | 512-d | ✓ zero-shot tags | 24 kHz | joint music-text space |
+| LP-MusicCaps | `lpmc` | 768-d | ✓ captions as tags | 16 kHz | vendored mel-CNN + bart-base; beam-5 captions per 10 s window; ckpt `transfer.pth` (~1.8 GB) downloads on first use |
+| Qwen2-Audio | `qwen2audio` | 1280-d | — | 16 kHz | Whisper-tower embeddings; only the audio tower loads; 16.8 GB bf16 ckpt on first use |
+| OpenL3 | `openl3` | 512/6144-d | — | 16 kHz | Tensorflow |
+| FFT | `fft` | 40-d | — | any | numpy-only, always available |
+
+**Tag scores are displayed as `log10(weight)`** (2 decimals, closer to 0 =
+more confident, `— (score 0)` for zero) everywhere chunk tags are shown.
+
+**Not shippable (verified 2026-09):** the requested **Audio Flamingo 2**
+(NVIDIA) is not a transformers model — its HF repo ships raw custom
+checkpoints only (no `config.json`, no code; `trust_remote_code` has
+nothing to load), its checkpoints are non-commercial (NVIDIA OneWay +
+Qwen research license), and the base model is ~37 GB fp32 of CUDA-era
+research code. **SALMONN** is pinned to `torch==2.0.1` /
+`transformers==4.28.0` / python 3.9 with a CUDA-only stack (and its
+official BEATs download link is dead), and **LTU** requires vendored
+patched transformers + torch 1.13 with no license file at all. All
+three were verified against their upstream repos and cannot be loaded
+by this app's stack (Python 3.14 / torch 2.14 / transformers 5.x /
+macOS MPS); they are documented here instead of shipping broken
+plugins. If NVIDIA ever ships AF3 checkpoints through plain
+transformers (`AudioFlamingo3*` classes exist in v5), that is the
+natural future addition.
 
 ## Install & run
 
@@ -209,13 +283,36 @@ Optional extras:
   models; its ~1.3 GB weights download on first use and its embeddings are
   stored under their own model key, alongside (not replacing) MERT-95M.
   Apple Silicon via MPS when available.
+- **M2D-CLAP plugin** (NTT, IEEE Access 2025) — 768-d audio-language
+  embeddings aligned with a BERT text space (zero-shot tags: *"... can be
+  heard"* prompts). Requires `pip install timm einops nnAudio`; on first use
+  the official runtime and the ~1.5 GB checkpoint are fetched from
+  [NTT's m2d release v0.5.0](https://github.com/nttcslab/m2d/releases) into
+  `data/models/m2d/`. **License: NTT non-commercial evaluation license** —
+  triggering the download means you accept its terms; use is for internal,
+  non-commercial evaluation.
+- **MuQ plugin** (Tencent, arXiv 2501.01108) — 1024-d self-supervised music
+  embeddings (Mel-RVQ masked modeling, SOTA on the MARBLE music benchmark),
+  24 kHz input, weights from Hugging Face (`OpenMuQ/MuQ-large-msd-iter`).
+  The `muq` package ships incomplete pip metadata, so install its real
+  dependencies explicitly:
+  `pip install muq easydict torchaudio x-clip librosa` (torch/numpy/etc.
+  are already present); the app's availability check covers them. The
+  plugin also shims muq 0.1.0 for transformers v5 (restores the v4-style
+  per-layer hidden-states tuple and the missing EasyDict attention
+  attribute) — no weight changes, verified against the real checkpoints.
+- **MuQ-MuLan plugin** — same `pip install muq`; CLIP-like joint music-text
+  embeddings (512-d, English and Chinese captions, ~10 s clips — long chunks
+  are analyzed in 10 s windows and pooled) with zero-shot tag support
+  (`OpenMuQ/MuQ-MuLan-large`).
 - **Ollama similarity** — start `ollama serve` with at least one embedding model
   (e.g. `ollama pull nomic-embed-text`).
 
 ## Configuration
 
 The *Settings…* dialog is organized as a sidebar (General, Analysis
-models, CLAP, MERT, MERT-330M, FFT, Ollama) so every page fits on screen.
+models, CLAP, MERT, MERT-330M, M2D-CLAP, MuQ, MuQ-MuLan, FFT, Ollama) so
+every page fits on screen.
 General holds the chunk seconds, overlap percent and a *Skip files longer
 than 20 minutes* checkbox (parallel analysis is automatic: FFT-only runs
 use every core but one, all other models run sequentially) (batch runs leave oversized files unanalyzed — they stay
@@ -225,14 +322,18 @@ per-model options for **CLAP** (model id, tag top-K, batch size, and a
 **candidate-tags editor** — one tag per line — that replaces the built-in
 ~90-tag list CLAP scores chunks against; *Restore default list* puts the
 originals back, and an empty or default list defers to the plugin's built-in
-list), **MERT**
-(model id, window length/overlap for the MPS long-chunk limit, batch size)
-and **FFT** (window length for the spectral statistics), Ollama host +
-embedding model (+ *Detect* button), playlist length.
+list), **MERT** (model id, window length/overlap for the MPS long-chunk
+limit, batch size), **M2D-CLAP** (tag top-K, batch size, candidate-tags
+editor — note the non-commercial NTT license), **MuQ** (model id, window
+length/overlap, batch size) and **MuQ-MuLan** (model id, window
+length/overlap, batch size, tag top-K, candidate-tags editor), **FFT**
+(window length for the spectral statistics), Ollama host + embedding model
+(+ *Detect* button), playlist length.
 Persisted to `data/config.json`; the library lives in `data/library.db`
-(override with `HOLOSMART_DATA_DIR` / `HOLOSMART_DB`). Configs written before
-the FFT plugin existed get `fft` enabled exactly once on first load; after
-that your own model on/off choices are kept.
+(override with `HOLOSMART_DATA_DIR` / `HOLOSMART_DB`). Older configs get new
+model plugins enabled exactly once on first load (a `models_version` field
+guards each roster migration: v2 added `fft`, v3 added `m2dclap`, `muq`,
+`muqlan`); after that your own model on/off choices are kept.
 
 ## Architecture
 
@@ -241,7 +342,8 @@ app/
   config.py               paths + AppConfig (JSON persistence)
   db/                     schema.sql, Database (WAL, per-thread connections), repo (DAO)
   audio/                  decode.py (ffmpeg/soundfile/wave), chunking.py, resample.py
-  models/                 base.py (ModelPlugin contract), clap/mert/openl3/fft, registry
+  models/                 base.py (ModelPlugin contract), clap/mert/m2dclap/muq/openl3/fft,
+                          registry
   analysis/pipeline.py    decode -> chunk -> plugins -> embeddings/tags -> description
   similarity/             ollama.py (client + embedding-model detection), search.py,
                           pareto.py, chunk_distances.py (EMD / Chamfer)
