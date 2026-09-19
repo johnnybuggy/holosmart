@@ -101,13 +101,19 @@ class TestFolderTree(UiTestBase):
         self.assertEqual(tree.selected_folder_id(), self.folder_id)
         self.assertEqual(tree.selected_track_ids_in_folder(), [self.track_id])
 
-    def test_status_glyphs(self):
+    def test_status_tooltip_lines(self):
         from app.ui.folder_tree import FolderTree
         with self.db.transaction() as conn:
             repo.set_track_status(conn, self.track_id, "analyzed", "done")
         tree = FolderTree(self.db)
         tree.refresh()
-        self.assertEqual(tree.topLevelItem(0).child(0).text(1), "✓")
+        # The Status column is gone; the overall state rides on the
+        # column-0 tooltip's second line (path first).
+        tip = tree.topLevelItem(0).child(0).toolTip(0)
+        lines = tip.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].endswith("song.wav"))
+        self.assertEqual(lines[1], "analyzed — done")
 
     def test_nested_hierarchy(self):
         from app.ui.folder_tree import DIR_ROLE, FOLDER_ROLE, FolderTree
@@ -382,6 +388,28 @@ class TestDetailPaneWarnings(UiTestBase):
 
 
 class TestMainWindow(UiTestBase):
+    def test_startup_window_fills_available_desktop(self):
+        """The window starts as large as the desktop allows — but stays a
+        normal, resizable window (not maximized)."""
+        from PySide6.QtWidgets import QApplication
+
+        from app.ui.main_window import MainWindow
+        config = AppConfig()
+        config.use_ollama = False
+        window = MainWindow(config, db_path=self.db_path)
+        try:
+            screen = QApplication.primaryScreen()
+            available = screen.availableGeometry() if screen else None
+            if available is not None and available.isValid() \
+                    and available.width() >= 800:
+                self.assertEqual(window.geometry(), available)
+            else:   # tiny/offscreen screens: documented fixed fallback
+                self.assertEqual((window.width(), window.height()),
+                                 (1500, 940))
+            self.assertTrue(window.isMaximized() is False)
+        finally:
+            window.close()
+
     def test_main_window_constructs_and_shows_track(self):
         from app.ui.main_window import MainWindow
         config = AppConfig()
@@ -391,6 +419,57 @@ class TestMainWindow(UiTestBase):
         window._tree.select_track(self.track_id)
         self.assertEqual(window._details.current_track_id(), self.track_id)
         window.close()
+
+    def test_details_pane_can_be_squeezed_by_splitter(self):
+        """The splitter travels right: the tabs pane's wide Similar-tab
+        controls row must not impose its layout minimum on the pane."""
+        from PySide6.QtWidgets import QSplitter
+
+        from app.ui.main_window import MainWindow
+        config = AppConfig()
+        config.use_ollama = False
+        window = MainWindow(config, db_path=self.db_path)
+        window.show()
+        try:
+            self._app.processEvents()
+            splitter = window.findChild(QSplitter)
+            self.assertIsNotNone(splitter)
+            # an explicit small minimum overrides the ~1200 px layout hint
+            self.assertEqual(window._details.minimumWidth(), 340)
+            self.assertLess(window._details.minimumWidth(),
+                            window._details.minimumSizeHint().width())
+            window.resize(1000, 700)
+            self._app.processEvents()
+            splitter.setSizes([900, 100])
+            self._app.processEvents()
+            sizes = splitter.sizes()
+            self.assertLessEqual(sizes[1], 340)   # squeezed to the floor
+            # and back to the roomy default
+            splitter.setSizes([400, 600])
+            self._app.processEvents()
+            sizes = splitter.sizes()
+            self.assertGreater(sizes[1], sizes[0])
+        finally:
+            window.close()
+
+    def test_chunk_click_reaches_built_in_player(self):
+        """The Chunks tab's chunk_play_requested drives the PlayerBar."""
+        from app.ui.main_window import MainWindow
+        from app.ui.player import PlayerBar
+        config = AppConfig()
+        config.use_ollama = False
+        window = MainWindow(config, db_path=self.db_path)
+        try:
+            player = window.findChild(PlayerBar)
+            self.assertIsNotNone(player)
+            self.assertTrue(player.available)
+            seen: list[tuple] = []
+            player.play_chunk = lambda *a: seen.append(a)
+            window._details.chunk_play_requested.emit(
+                str(self.wav), 0.25, 0.5)
+            self.assertEqual(seen, [(str(self.wav), 0.25, 0.5)])
+        finally:
+            window.close()
 
     def test_settings_dialog_roundtrip(self):
         from app.ui.settings_dialog import SettingsDialog
@@ -593,16 +672,24 @@ class TestExcludedFromProgress(UiTestBase):
         # the flac is a regular row
         self.assertFalse(flac_item.data(0, EXCLUDED_ROLE))
         self.assertNotEqual(flac_item.foreground(0).color().name(), "#9e9e9e")
-        # folder percentage counts ONLY the flac
+        # folder percentage counts ONLY the flac (first model column)
+        from app.models.registry import list_plugins
+        from app.ui.folder_tree import MODEL_COLUMN_OFFSET
+        col = MODEL_COLUMN_OFFSET
         folder = tree.topLevelItem(0)
-        self.assertEqual(folder.text(1), "0%")
-        self.assertEqual(folder.toolTip(1), "0 of 1 files analyzed")
-        # once the flac is analyzed the folder is 100% (wav ignored)
+        self.assertEqual(folder.text(col), "0%")
+        self.assertEqual(folder.toolTip(col), "0 of 1 files analyzed with CLAP")
+        # once the flac is analyzed (status + embeddings for every model)
+        # the folder is 100% (wav ignored)
+        vec = np.ones(8, dtype=np.float32) / 2.8
         with self.db.transaction() as conn:
+            ids = repo.replace_chunks(conn, flac_id, [(0, 0.0, 1.0)])
+            for plugin in list_plugins():
+                repo.add_chunk_embedding(conn, ids[0], plugin.name, vec)
             repo.set_track_status(conn, flac_id, "analyzed", "done")
         tree.update_track_status(flac_id, "analyzed", "done")
-        self.assertEqual(folder.text(1), "100%")
-        self.assertEqual(folder.toolTip(1), "1 of 1 files analyzed")
+        self.assertEqual(folder.text(col), "100%")
+        self.assertEqual(folder.toolTip(col), "1 of 1 files analyzed with CLAP")
         del QBrush
 
     def test_analyze_wav_true_counts_everything(self) -> None:
@@ -612,7 +699,8 @@ class TestExcludedFromProgress(UiTestBase):
         tree = FolderTree(self.db)   # no exclusions passed
         tree.refresh()
         folder = tree.topLevelItem(0)
-        self.assertEqual(folder.toolTip(1), "0 of 2 files analyzed")
+        self.assertEqual(folder.toolTip(1),
+                         "0 of 2 files analyzed with CLAP")
 
     def test_main_window_wires_wav_exclusion(self) -> None:
         from app.config import AppConfig
@@ -1140,6 +1228,22 @@ class TestTreeStatusUpdates(UiTestBase):
         tree.refresh()
         return tree
 
+    def _mark_analyzed(self, track_id: int) -> None:
+        """Full analysis state: status + embeddings for every registered
+        model — the per-model ✓ columns are what drive the percentages."""
+        from app.models.registry import list_plugins
+        vec = np.ones(8, dtype=np.float32) / 2.8
+        with self.db.transaction() as conn:
+            ids = repo.replace_chunks(conn, track_id, [(0, 0.0, 1.0)])
+            for plugin in list_plugins():
+                repo.add_chunk_embedding(conn, ids[0], plugin.name, vec)
+            repo.set_track_status(conn, track_id, "analyzed", "done")
+
+    def _first_model_column(self, tree) -> int:
+        from app.models.registry import list_plugins
+        from app.ui.folder_tree import MODEL_COLUMN_OFFSET
+        return MODEL_COLUMN_OFFSET  # first registered plugin (clap)
+
     def test_update_track_status_preserves_selection_and_expansion(self):
         deep_id = self._add_track("artists/Alpha/2024/live_set.wav")
         self._add_track("jazz/c.wav")
@@ -1153,91 +1257,91 @@ class TestTreeStatusUpdates(UiTestBase):
         self.assertTrue(year.isExpanded())
         self.assertFalse(jazz.isExpanded())     # unrelated branch collapsed
         item = self._track_item(tree, deep_id)
-        self.assertEqual(item.text(1), "•")
+        self.assertTrue(item.toolTip(0).splitlines()[-1].startswith("new"))
 
         tree.update_track_status(deep_id, "analyzed", "done")
 
-        self.assertEqual(item.text(1), "✓")
-        self.assertEqual(item.toolTip(1), "analyzed — done")
+        self.assertEqual(item.toolTip(0).splitlines()[-1], "analyzed — done")
         self.assertIs(tree.currentItem(), current)   # selection untouched
         self.assertEqual(tree.selected_track_id(), deep_id)
         self.assertTrue(artists.isExpanded())        # expansion untouched
         self.assertTrue(year.isExpanded())
         self.assertFalse(jazz.isExpanded())
 
-    def test_update_track_status_glyph_and_tooltip_formats(self):
+    def test_update_track_status_tooltip_formats(self):
         tree = self._tree()
         item = self._track_item(tree, self.track_id)
         tree.update_track_status(self.track_id, "analyzing", None)
-        self.assertEqual(item.text(1), "…")
-        self.assertEqual(item.toolTip(1), "analyzing")
-        self.assertEqual(item.toolTip(0), str(self.wav))   # path tooltip kept
+        self.assertEqual(item.toolTip(0),
+                         f"{self.wav}\nanalyzing")   # path + status lines
         tree.update_track_status(self.track_id, "error",
                                  "Decode failed: broken file")
-        self.assertEqual(item.text(1), "✗")
-        self.assertEqual(item.toolTip(1), "error — Decode failed: broken file")
+        self.assertEqual(item.toolTip(0),
+                         f"{self.wav}\nerror — Decode failed: broken file")
 
     def test_update_track_status_unknown_track_is_noop(self):
         tree = self._tree()
         root = tree.topLevelItem(0)
-        before = (root.text(1), root.toolTip(1))
+        before = (root.text(1), root.toolTip(1), root.child(0).toolTip(0))
         tree.update_track_status(999999, "analyzed", "done")
-        self.assertEqual((root.text(1), root.toolTip(1)), before)
+        self.assertEqual((root.text(1), root.toolTip(1),
+                          root.child(0).toolTip(0)), before)
 
     def test_folder_percentage_counts_analyzed_files(self):
         a_id = self._add_track("rock/a.wav")
         self._add_track("rock/b.wav")
         c_id = self._add_track("rock/deep/c.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
-            repo.set_track_status(conn, c_id, "analyzed", "done")
+        self._mark_analyzed(a_id)
+        self._mark_analyzed(c_id)
         tree = self._tree()
+        col = self._first_model_column(tree)
         deep = self._dir_item(tree, self.dir / "rock" / "deep")
         rock = self._dir_item(tree, self.dir / "rock")
         root = tree.topLevelItem(0)
-        self.assertEqual(deep.text(1), "100%")
-        self.assertEqual(rock.text(1), "67%")   # 66.67% rounds to 67
-        self.assertEqual(rock.toolTip(1), "2 of 3 files analyzed")
+        self.assertEqual(deep.text(col), "100%")
+        self.assertEqual(rock.text(col), "67%")   # 66.67% rounds to 67
+        self.assertEqual(rock.toolTip(col), "2 of 3 files analyzed with CLAP")
         # root aggregate includes the root-level song.wav (still "new")
-        self.assertEqual(root.text(1), "50%")
+        self.assertEqual(root.text(col), "50%")
 
     def test_update_track_status_recomputes_ancestor_percentages_only(self):
         a_id = self._add_track("rock/a.wav")
         b_id = self._add_track("rock/deep/b.wav")
         self._add_track("jazz/c.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, b_id, "analyzed", "done")
+        self._mark_analyzed(b_id)
         tree = self._tree()
+        col = self._first_model_column(tree)
         rock = self._dir_item(tree, self.dir / "rock")
         deep = self._dir_item(tree, self.dir / "rock" / "deep")
         jazz = self._dir_item(tree, self.dir / "jazz")
         root = tree.topLevelItem(0)
-        self.assertEqual(rock.text(1), "50%")
-        self.assertEqual(deep.text(1), "100%")
-        self.assertEqual(jazz.text(1), "0%")
-        self.assertEqual(root.text(1), "25%")
+        self.assertEqual(rock.text(col), "50%")
+        self.assertEqual(deep.text(col), "100%")
+        self.assertEqual(jazz.text(col), "0%")
+        self.assertEqual(root.text(col), "25%")
 
+        self._mark_analyzed(a_id)
         tree.update_track_status(a_id, "analyzed", "done")
 
-        self.assertEqual(rock.text(1), "100%")   # ancestor updated
-        self.assertEqual(root.text(1), "50%")    # ancestor updated
-        self.assertEqual(deep.text(1), "100%")   # unchanged subtree
-        self.assertEqual(jazz.text(1), "0%")     # untouched branch
+        self.assertEqual(rock.text(col), "100%")   # ancestor updated
+        self.assertEqual(root.text(col), "50%")    # ancestor updated
+        self.assertEqual(deep.text(col), "100%")   # unchanged subtree
+        self.assertEqual(jazz.text(col), "0%")     # untouched branch
 
     def test_folder_percentages_survive_full_refresh(self):
         a_id = self._add_track("rock/a.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
+        self._mark_analyzed(a_id)
         self._add_track("rock/deep/b.wav")
         tree = self._tree()
         tree.refresh()          # full rebuild — percentages recomputed
+        col = self._first_model_column(tree)
         rock = self._dir_item(tree, self.dir / "rock")
         deep = self._dir_item(tree, self.dir / "rock" / "deep")
         root = tree.topLevelItem(0)
-        self.assertEqual(rock.text(1), "50%")
-        self.assertEqual(deep.text(1), "0%")
-        self.assertEqual(root.text(1), "33%")
-        self.assertEqual(rock.toolTip(1), "1 of 2 files analyzed")
+        self.assertEqual(rock.text(col), "50%")
+        self.assertEqual(deep.text(col), "0%")
+        self.assertEqual(root.text(col), "33%")
+        self.assertEqual(rock.toolTip(col), "1 of 2 files analyzed with CLAP")
 
     def test_complete_folder_status_turns_green(self):
         from PySide6.QtGui import QColor
@@ -1245,13 +1349,13 @@ class TestTreeStatusUpdates(UiTestBase):
         from app.ui.folder_tree import _COMPLETE_GREEN
         a_id = self._add_track("rock/a.wav")
         b_id = self._add_track("rock/b.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
-            repo.set_track_status(conn, b_id, "analyzed", "done")
+        self._mark_analyzed(a_id)
+        self._mark_analyzed(b_id)
         tree = self._tree()
+        col = self._first_model_column(tree)
         rock = self._dir_item(tree, self.dir / "rock")
-        self.assertEqual(rock.text(1), "100%")   # text format unchanged
-        self.assertEqual(QColor(rock.foreground(1).color()).name(),
+        self.assertEqual(rock.text(col), "100%")   # text format unchanged
+        self.assertEqual(QColor(rock.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
 
     def test_incomplete_folder_status_is_not_green(self):
@@ -1260,14 +1364,14 @@ class TestTreeStatusUpdates(UiTestBase):
         from app.ui.folder_tree import _COMPLETE_GREEN
         a_id = self._add_track("rock/a.wav")
         self._add_track("rock/b.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
+        self._mark_analyzed(a_id)
         tree = self._tree()
+        col = self._first_model_column(tree)
         rock = self._dir_item(tree, self.dir / "rock")
-        self.assertEqual(rock.text(1), "50%")
-        self.assertNotEqual(QColor(rock.foreground(1).color()).name(),
+        self.assertEqual(rock.text(col), "50%")
+        self.assertNotEqual(QColor(rock.foreground(col).color()).name(),
                             QColor(_COMPLETE_GREEN).name())
-        self.assertEqual(rock.foreground(1), QBrush())   # default foreground
+        self.assertEqual(rock.foreground(col), QBrush())   # default foreground
 
     def test_update_track_status_turns_complete_folder_green_in_place(self):
         from PySide6.QtGui import QColor
@@ -1275,25 +1379,26 @@ class TestTreeStatusUpdates(UiTestBase):
         from app.ui.folder_tree import _COMPLETE_GREEN
         a_id = self._add_track("rock/a.wav")
         b_id = self._add_track("rock/deep/b.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
+        self._mark_analyzed(a_id)
         tree = self._tree()
         tree.select_track(a_id)
         current = tree.currentItem()
+        col = self._first_model_column(tree)
         rock = self._dir_item(tree, self.dir / "rock")
         deep = self._dir_item(tree, self.dir / "rock" / "deep")
-        self.assertEqual(deep.text(1), "0%")
-        self.assertNotEqual(QColor(deep.foreground(1).color()).name(),
+        self.assertEqual(deep.text(col), "0%")
+        self.assertNotEqual(QColor(deep.foreground(col).color()).name(),
                             QColor(_COMPLETE_GREEN).name())
 
+        self._mark_analyzed(b_id)
         tree.update_track_status(b_id, "analyzed", None)
 
         # deep folder and its ancestor chain flip green immediately
-        self.assertEqual(deep.text(1), "100%")
-        self.assertEqual(QColor(deep.foreground(1).color()).name(),
+        self.assertEqual(deep.text(col), "100%")
+        self.assertEqual(QColor(deep.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
-        self.assertEqual(rock.text(1), "100%")
-        self.assertEqual(QColor(rock.foreground(1).color()).name(),
+        self.assertEqual(rock.text(col), "100%")
+        self.assertEqual(QColor(rock.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
         self.assertIs(tree.currentItem(), current)   # selection untouched
         self.assertEqual(tree.selected_track_id(), a_id)
@@ -1304,9 +1409,9 @@ class TestTreeStatusUpdates(UiTestBase):
         from app.ui.folder_tree import _COMPLETE_GREEN
         a_id = self._add_track("rock/a.wav")
         b_id = self._add_track("rock/deep/b.wav")
+        self._mark_analyzed(a_id)
+        self._mark_analyzed(b_id)
         with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
-            repo.set_track_status(conn, b_id, "analyzed", "done")
             second_folder_id = repo.add_folder(conn,
                                                str(self.dir / "elsewhere"))
         path = self.dir / "elsewhere" / "x.wav"
@@ -1326,27 +1431,27 @@ class TestTreeStatusUpdates(UiTestBase):
         first = roots[str(self.dir)]
         second = roots[str(self.dir / "elsewhere")]
         rock = self._dir_item(tree, self.dir / "rock")
+        col = self._first_model_column(tree)
         # complete subfolder is green, but the root is not: song.wav is "new"
-        self.assertEqual(QColor(rock.foreground(1).color()).name(),
+        self.assertEqual(QColor(rock.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
-        self.assertEqual(first.text(1), "67%")
-        self.assertNotEqual(QColor(first.foreground(1).color()).name(),
+        self.assertEqual(first.text(col), "67%")
+        self.assertNotEqual(QColor(first.foreground(col).color()).name(),
                             QColor(_COMPLETE_GREEN).name())
-        self.assertEqual(second.text(1), "0%")
-        self.assertNotEqual(QColor(second.foreground(1).color()).name(),
+        self.assertEqual(second.text(col), "0%")
+        self.assertNotEqual(QColor(second.foreground(col).color()).name(),
                             QColor(_COMPLETE_GREEN).name())
 
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, self.track_id, "analyzed", "done")
+        self._mark_analyzed(self.track_id)
         tree.update_track_status(self.track_id, "analyzed", None)
 
         # last file analysed: the root (whole subtree incl. root-level files
         # and every subfolder) turns green; the other root stays non-green
-        self.assertEqual(first.text(1), "100%")
-        self.assertEqual(QColor(first.foreground(1).color()).name(),
+        self.assertEqual(first.text(col), "100%")
+        self.assertEqual(QColor(first.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
-        self.assertEqual(second.text(1), "0%")
-        self.assertNotEqual(QColor(second.foreground(1).color()).name(),
+        self.assertEqual(second.text(col), "0%")
+        self.assertNotEqual(QColor(second.foreground(col).color()).name(),
                             QColor(_COMPLETE_GREEN).name())
 
     def test_complete_folder_green_survives_refresh(self):
@@ -1354,20 +1459,20 @@ class TestTreeStatusUpdates(UiTestBase):
 
         from app.ui.folder_tree import _COMPLETE_GREEN
         a_id = self._add_track("rock/a.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
-            repo.set_track_status(conn, self.track_id, "analyzed", "done")
+        self._mark_analyzed(a_id)
+        self._mark_analyzed(self.track_id)
         tree = self._tree()
-        self.assertEqual(QColor(tree.topLevelItem(0).foreground(1).color())
+        col = self._first_model_column(tree)
+        self.assertEqual(QColor(tree.topLevelItem(0).foreground(col).color())
                          .name(), QColor(_COMPLETE_GREEN).name())
         tree.refresh()          # full rebuild — green recomputed, not kept
         rock = self._dir_item(tree, self.dir / "rock")
         root = tree.topLevelItem(0)
-        self.assertEqual(rock.text(1), "100%")
-        self.assertEqual(QColor(rock.foreground(1).color()).name(),
+        self.assertEqual(rock.text(col), "100%")
+        self.assertEqual(QColor(rock.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
-        self.assertEqual(root.text(1), "100%")
-        self.assertEqual(QColor(root.foreground(1).color()).name(),
+        self.assertEqual(root.text(col), "100%")
+        self.assertEqual(QColor(root.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
 
     def test_reverting_track_status_clears_folder_green(self):
@@ -1376,22 +1481,24 @@ class TestTreeStatusUpdates(UiTestBase):
         from app.ui.folder_tree import _COMPLETE_GREEN
         a_id = self._add_track("rock/a.wav")
         b_id = self._add_track("rock/b.wav")
-        with self.db.transaction() as conn:
-            repo.set_track_status(conn, a_id, "analyzed", "done")
-            repo.set_track_status(conn, b_id, "analyzed", "done")
+        self._mark_analyzed(a_id)
+        self._mark_analyzed(b_id)
         tree = self._tree()
+        col = self._first_model_column(tree)
         rock = self._dir_item(tree, self.dir / "rock")
-        self.assertEqual(QColor(rock.foreground(1).color()).name(),
+        self.assertEqual(QColor(rock.foreground(col).color()).name(),
                          QColor(_COMPLETE_GREEN).name())
 
+        # revert: analysis results removed (chunks cleared) -> the check
+        # marks disappear and the folder drops back to 50%
         with self.db.transaction() as conn:
-            repo.set_track_status(conn, b_id, "new")
+            repo.clear_track_analysis(conn, b_id)
         tree.update_track_status(b_id, "new", None)
 
-        self.assertEqual(rock.text(1), "50%")
-        self.assertNotEqual(QColor(rock.foreground(1).color()).name(),
+        self.assertEqual(rock.text(col), "50%")
+        self.assertNotEqual(QColor(rock.foreground(col).color()).name(),
                             QColor(_COMPLETE_GREEN).name())
-        self.assertEqual(rock.foreground(1), QBrush())   # green cleared
+        self.assertEqual(rock.foreground(col), QBrush())   # green cleared
 
 
 class TestScanHighlight(UiTestBase):
@@ -1585,10 +1692,10 @@ class ModelStatusColumnTests(UiTestBase):
         from app.models.registry import list_plugins
         from app.ui.folder_tree import FolderTree
         tree = FolderTree(self.db)
-        self.assertEqual(tree.columnCount(), 2 + len(list_plugins()))
+        self.assertEqual(tree.columnCount(), 1 + len(list_plugins()))
         labels = [tree.headerItem().text(c) for c in range(tree.columnCount())]
-        self.assertEqual(labels[:2], ["Library", "Status"])
-        self.assertEqual(labels[2:],
+        self.assertEqual(labels[0], "Library")
+        self.assertEqual(labels[1:],
                          [p.display_name for p in list_plugins()])
 
     @staticmethod
@@ -1607,7 +1714,6 @@ class ModelStatusColumnTests(UiTestBase):
         item = self._track_item(tree, self.track_id)
         col = self._model_columns(tree)
         # unanalyzed track: only models with stored results get a check mark
-        self.assertEqual(item.text(1), "•")
         self.assertEqual([item.text(col[m]) for m in ("clap", "mert")],
                          ["✓", "✓"])
         self.assertEqual(
@@ -1634,13 +1740,40 @@ class ModelStatusColumnTests(UiTestBase):
         tree = FolderTree(self.db)
         tree.refresh()
         root = tree.topLevelItem(0)
-        self.assertEqual(root.text(1), "100%")
         # CLAP complete; the other models have no results on this track
         col = self._model_columns(tree)
         self.assertEqual(root.text(col["clap"]), "100%")
         for name in ("mert", "mert330", "openl3", "fft"):
             self.assertEqual(root.text(col[name]), "0%", name)
         self.assertIn("CLAP", root.toolTip(col["clap"]))
+
+    def test_zero_coverage_model_columns_are_hidden(self):
+        from app.ui.folder_tree import FolderTree
+        # setUp's track has no embeddings: EVERY model column must be hidden
+        tree = FolderTree(self.db)
+        tree.refresh()
+        col = self._model_columns(tree)
+        for name in col.values():
+            self.assertTrue(tree.isColumnHidden(name), name)
+        # giving the track results for a subset reveals exactly those
+        self._give_embeddings(self.track_id, ("clap", "fft"))
+        tree.refresh()
+        self.assertFalse(tree.isColumnHidden(col["clap"]))
+        self.assertFalse(tree.isColumnHidden(col["fft"]))
+        self.assertTrue(tree.isColumnHidden(col["mert"]))
+
+    def test_first_results_unhide_a_column_in_place(self):
+        from app.ui.folder_tree import FolderTree
+        tree = FolderTree(self.db)
+        tree.refresh()
+        col = self._model_columns(tree)
+        self.assertTrue(tree.isColumnHidden(col["mert"]))
+        # an analysis run lands the first MERT chunks: the column reappears
+        # immediately (no full refresh needed)
+        self._give_embeddings(self.track_id, ("mert",))
+        tree.update_track_status(self.track_id, "analyzed", "done")
+        self.assertFalse(tree.isColumnHidden(col["mert"]))
+        self.assertEqual(tree._covered_models, {"mert"})
 
     def test_update_track_status_refreshes_model_columns_in_place(self):
         from app.ui.folder_tree import FolderTree, MODEL_COLUMN_OFFSET
@@ -1654,7 +1787,6 @@ class ModelStatusColumnTests(UiTestBase):
         with self.db.transaction() as conn:
             repo.clear_track_analysis(conn, self.track_id)
         tree.update_track_status(self.track_id, "new", None)
-        self.assertEqual(item.text(1), "•")
         for column in range(MODEL_COLUMN_OFFSET, tree.columnCount()):
             self.assertEqual(item.text(column), "")
 
@@ -1696,32 +1828,83 @@ class FilenameColumnWidthTests(UiTestBase):
         tree.refresh()
         self.assertGreater(tree.header().sectionSize(0), width - 1)
 
-    def test_name_column_never_pushes_status_columns_out_of_view(self):
+    def test_columns_keep_content_width_and_scroll_horizontally(self):
+        from app.models.registry import list_plugins
         from app.ui.folder_tree import FolderTree
-        self._make_track(
+        track_id = self._make_track(
             "artists/Alpha/2024/live_set_with_a_rather_long_name.wav")
+        # Embeddings for every model: with zero coverage the model columns
+        # are hidden (see ModelStatusColumnTests), which would empty this
+        # test's subject — the visible status area.
+        vec = np.ones(8, dtype=np.float32) / 2.8
+        with self.db.transaction() as conn:
+            ids = repo.replace_chunks(conn, track_id, [(0, 0.0, 1.0)])
+            for plugin in list_plugins():
+                repo.add_chunk_embedding(conn, ids[0], plugin.name, vec)
         tree = FolderTree(self.db)
-        tree.resize(620, 400)      # the default-ish pane width
-        tree.refresh()
-        header = tree.header()
-        total = sum(header.sectionSize(c) for c in range(tree.columnCount()))
-        # The whole status area (Status + one column per model) stays inside
-        # the visible pane instead of starting behind an 800px name column.
-        self.assertLessEqual(total, tree.width() + 4)
-        # ... and every status column stays at least wide enough for its
-        # own header label (no truncated headers).
-        from PySide6.QtGui import QFontMetrics
-        metrics = QFontMetrics(tree.font())
-        for column in range(1, tree.columnCount()):
-            label = tree.headerItem().text(column)
-            self.assertGreaterEqual(
-                header.sectionSize(column),
-                metrics.horizontalAdvance(label), label)
-        # the name column gave up its excess but stayed readable
-        self.assertGreaterEqual(header.sectionSize(0), 120)
+        tree.resize(420, 400)      # a narrow pane — far less than needed
+        tree.show()
+        try:
+            tree.refresh()
+            header = tree.header()
+            # The roster is wider than 620px: nothing is squeezed — every
+            # per-model column keeps at least its header label's width and
+            # the user scrolls horizontally to reach the hidden ones.
+            from PySide6.QtGui import QFontMetrics
+            metrics = QFontMetrics(tree.font())
+            for column in range(1, tree.columnCount()):
+                if tree.isColumnHidden(column):
+                    continue
+                label = tree.headerItem().text(column)
+                self.assertGreaterEqual(
+                    header.sectionSize(column),
+                    metrics.horizontalAdvance(label), label)
+            total = sum(header.sectionSize(c)
+                        for c in range(tree.columnCount()))
+            # 420px cannot hold every model column at label width: the
+            # columns are NOT squeezed to fit, so the tree shows a
+            # horizontal scrollbar for the remainder.
+            self.assertGreater(total, tree.width() + 4)   # scrollbar case
+            self.assertGreater(tree.horizontalScrollBar().maximum(), 0)
+            # the name column stays readable
+            self.assertGreaterEqual(header.sectionSize(0), 120)
+        finally:
+            tree.close()
 
-    def test_narrow_pane_rebalances_on_resize(self):
+    def test_wide_pane_shows_everything_without_scroll(self):
+        from app.models.registry import list_plugins
         from app.ui.folder_tree import FolderTree
+        track_id = self._make_track("song.wav")
+        vec = np.ones(8, dtype=np.float32) / 2.8
+        with self.db.transaction() as conn:
+            ids = repo.replace_chunks(conn, track_id, [(0, 0.0, 1.0)])
+            for plugin in list_plugins():
+                repo.add_chunk_embedding(conn, ids[0], plugin.name, vec)
+        tree = FolderTree(self.db)
+        tree.resize(1400, 400)     # roomy: every column fits
+        tree.show()
+        try:
+            tree.refresh()
+            total = sum(tree.header().sectionSize(c)
+                        for c in range(tree.columnCount()))
+            self.assertLessEqual(total, tree.width() + 4)
+            # no leftover width is dumped into the last model column
+            self.assertEqual(
+                tree.header().stretchLastSection(), False)
+        finally:
+            tree.close()
+
+    def test_narrow_pane_shrinks_name_column_on_resize(self):
+        from app.models.registry import list_plugins
+        from app.ui.folder_tree import FolderTree
+        track_id = self._make_track("song.wav")
+        # visible model columns: without them (zero coverage hides them all)
+        # the name column legitimately owns the whole pane width
+        vec = np.ones(8, dtype=np.float32) / 2.8
+        with self.db.transaction() as conn:
+            ids = repo.replace_chunks(conn, track_id, [(0, 0.0, 1.0)])
+            for plugin in list_plugins():
+                repo.add_chunk_embedding(conn, ids[0], plugin.name, vec)
         tree = FolderTree(self.db)
         tree.resize(1200, 400)
         tree.show()     # resize events are only delivered to shown widgets
@@ -1730,9 +1913,8 @@ class FilenameColumnWidthTests(UiTestBase):
             wide = tree.header().sectionSize(0)
             tree.resize(560, 400)      # user drags the splitter narrower
             self.assertLess(tree.header().sectionSize(0), wide)
-            total = sum(tree.header().sectionSize(c)
-                        for c in range(tree.columnCount()))
-            self.assertLessEqual(total, 560 + 4)
+            # the name column never collapses below its minimum
+            self.assertGreaterEqual(tree.header().sectionSize(0), 120)
         finally:
             tree.close()
 
@@ -1983,10 +2165,10 @@ class AnalysisHighlightTests(UiTestBase):
             stack.extend(item.child(i) for i in range(item.childCount()))
 
     def _item_by_path(self, tree, path: str):
-        from app.ui.folder_tree import TRACK_ROLE
+        from app.ui.folder_tree import PATH_ROLE, TRACK_ROLE
         for item in self._walk(tree):
             if item.data(0, TRACK_ROLE) is not None \
-                    and str(item.toolTip(0)) == path:
+                    and str(item.data(0, PATH_ROLE)) == path:
                 return item
         return None
 
@@ -2128,6 +2310,55 @@ class FolderReferencesTests(UiTestBase):
             win._on_add_folder_references()
             seeds = win._details._seed_ids()
             self.assertEqual(sorted(seeds), sorted([in_folder, also_folder]))
+        finally:
+            win.close()
+
+    def test_clear_empties_references_and_keeps_them_empty(self) -> None:
+        """Pressing Clear must leave the list empty — the selected file must
+        NOT be re-added by the auto-fill until the selection changes."""
+        self._add_nested_track("sub/b.wav")
+        win = self._window()
+        try:
+            tree = win._tree
+            tree.setCurrentItem(self._item_by_name(tree, "b.wav"))
+            win._on_add_folder_references()
+            self.assertGreater(len(win._details._seed_ids()), 0)
+
+            win._details._on_clear_seeds()
+            self.assertEqual(win._details._seed_ids(), [])
+            # the still-selected file does not sneak back in
+            win._details._sync_seed_list_with_selection()
+            self.assertEqual(win._details._seed_ids(), [])
+        finally:
+            win.close()
+
+    def test_selection_change_resumes_autofill_after_clear(self) -> None:
+        self._add_nested_track("sub/b.wav")
+        other = self._add_nested_track("top.wav")
+        win = self._window()
+        try:
+            tree = win._tree
+            tree.setCurrentItem(self._item_by_name(tree, "b.wav"))
+            win._details._on_clear_seeds()
+            self.assertEqual(win._details._seed_ids(), [])
+            # picking a DIFFERENT file re-enables the auto entry
+            tree.setCurrentItem(self._item_by_name(tree, "top.wav"))
+            self.assertEqual(win._details._seed_ids(), [other])
+        finally:
+            win.close()
+
+    def test_reference_box_is_compact(self) -> None:
+        from PySide6.QtWidgets import QSizePolicy
+
+        win = self._window()
+        try:
+            details = win._details
+            self.assertLessEqual(details._seed_list.maximumHeight(), 72)
+            # Maximum vertical policy: the box hugs its content and can
+            # never grow into the results table's space
+            self.assertEqual(details._refs_box.sizePolicy().verticalPolicy(),
+                             QSizePolicy.Policy.Maximum)
+            self.assertLessEqual(details._refs_box.sizeHint().height(), 120)
         finally:
             win.close()
 

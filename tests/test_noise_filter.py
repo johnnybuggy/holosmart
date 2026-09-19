@@ -172,7 +172,7 @@ class NoiseFilterFitTests(_NoiseLibraryTestCase):
             self.assertIn("limited to 10", str(ctx.exception))
         finally:
             nf.OPTICS_MAX_POINTS = original
-        self.assertEqual(OPTICS_MAX_POINTS, 100_000)  # restored
+        self.assertEqual(OPTICS_MAX_POINTS, 1_000_000)  # restored
 
     def test_refit_replaces_previous_run(self) -> None:
         first = fit_noise_filter(self.db.db_path, "fft", "hdbscan")
