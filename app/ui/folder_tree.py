@@ -21,12 +21,14 @@ FOLDER_ROLE = Qt.ItemDataRole.UserRole + 1   # db folder id (library roots only)
 EXCLUDED_ROLE = Qt.ItemDataRole.UserRole + 4  # truthy: not subject to analysis
 TRACK_ROLE = Qt.ItemDataRole.UserRole + 2    # track id (file items)
 DIR_ROLE = Qt.ItemDataRole.UserRole + 3      # full directory path (subfolder nodes)
+PATH_ROLE = Qt.ItemDataRole.UserRole + 5     # full file path (track items)
 
-_STATUS_GLYPH = {"new": "•", "analyzing": "…", "analyzed": "✓", "error": "✗"}
-
-#: Column 0 = name, column 1 = overall analysis status, columns 2.. carry one
-#: status per registered model plugin (CLAP, MERT, OpenL3, FFT, …).
-MODEL_COLUMN_OFFSET = 2
+#: Column 0 = name, columns 1.. carry one status per registered model plugin
+#: (CLAP, MERT, OpenL3, FFT, …).  There is no separate overall Status
+#: column: the per-model columns carry the whole picture, and a model whose
+#: analysis coverage is zero (never run / nothing stored) has its column
+#: hidden entirely (see :meth:`refresh`).
+MODEL_COLUMN_OFFSET = 1
 
 #: Glyph shown in a model column when the track's chunks carry that model's
 #: embeddings (:data:`_MODEL_MISSING` marks configured-but-absent results).
@@ -40,10 +42,6 @@ _MODEL_EXCLUDED = "–"
 #: neither count toward the analysis-progress percentages nor invite a run.
 _EXCLUDED_GREY = QColor("#9e9e9e")
 
-#: Upper bound for the overall Status column.  Its cells hold a glyph or a
-#: progress percentage; anything longer lives in the cell tooltip.
-_STATUS_COLUMN_MAX_WIDTH = 110
-
 #: Upper bound for the per-model columns (glyphs + progress percentages).
 #: Without these caps the columns grow past the tree pane and the status
 #: area disappears from view entirely.
@@ -55,13 +53,14 @@ _MODEL_COLUMN_MAX_WIDTH = 96
 _NAME_MIN_WIDTH = 120
 
 
+
 def _status_text_column(index: int) -> int:
     """Item column carrying the status cell for count-entry *index*.
 
-    Index 0 (overall status) lives in column 1; index ``1 + k`` (the *k*-th
-    model plugin) lives in column ``MODEL_COLUMN_OFFSET + k``.
+    Index ``k`` (the *k*-th model plugin) lives in column
+    ``MODEL_COLUMN_OFFSET + k``.
     """
-    return 1 if index == 0 else MODEL_COLUMN_OFFSET + index - 1
+    return MODEL_COLUMN_OFFSET + index
 
 #: Brush painting live activity (scanning library roots; tracks under
 #: analysis and their folder chain).  A semi-transparent amber tint instead
@@ -98,8 +97,11 @@ class FolderTree(QTreeWidget):
         # and they do not count toward the analysis-progress percentages.
         self._excluded_extensions = {e.lower() for e in excluded_extensions}
         # Registered model plugins (process-wide singletons, cheap to list):
-        # one status column per plugin, appended after the overall Status.
+        # one status column per plugin, appended after the name column.
         self._plugins = list_plugins()
+        # Model names with at least one stored embedding in the library —
+        # columns of everything else are hidden (recomputed per refresh()).
+        self._covered_models: set[str] = set()
         # Normalized root paths currently in their scan/index phase, kept on
         # the instance so the yellow highlight survives refresh() rebuilds.
         self._scanning_paths: set[str] = set()
@@ -108,8 +110,12 @@ class FolderTree(QTreeWidget):
         # set_analyzing_paths); also survives refresh() rebuilds.
         self._analyzing_paths: set[str] = set()
         self.setHeaderLabels(
-            ["Library", "Status"]
-            + [plugin.display_name for plugin in self._plugins])
+            ["Library"] + [plugin.display_name for plugin in self._plugins])
+        # Column 0 (the name) is the de-facto stretch column — it takes the
+        # leftover width by design (see _autosize_name_column).  The header's
+        # built-in last-section stretch would instead feed every compressed
+        # model column's width into the LAST model column, defeating the cap.
+        self.header().setStretchLastSection(False)
         self.setRootIsDecorated(True)
         self.setAlternatingRowColors(True)
         self.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
@@ -141,6 +147,15 @@ class FolderTree(QTreeWidget):
             # One grouped query serves the per-model status columns of every
             # track: {track_id: {model: chunk-embedding count}}.
             embedding_counts = repo.get_all_track_embedding_counts(conn)
+            # Models with zero stored results anywhere in the library get
+            # their column hidden — a roster of 8 plugins must not waste
+            # pane width on models that have never produced anything here.
+            self._covered_models = {
+                plugin.name
+                for plugin in self._plugins
+                if any(int(counts.get(plugin.name, 0)) > 0
+                       for counts in embedding_counts.values())
+            }
             for folder in repo.list_folders(conn):
                 folder_item = QTreeWidgetItem([folder["path"], ""])
                 folder_item.setData(0, FOLDER_ROLE, int(folder["id"]))
@@ -151,6 +166,7 @@ class FolderTree(QTreeWidget):
                                        embedding_counts)
         finally:
             conn.close()
+        self._apply_model_column_visibility()
         self._sort_item(self.invisibleRootItem())
         if expanded_keys:
             self._restore_expanded(expanded_keys)
@@ -221,6 +237,19 @@ class FolderTree(QTreeWidget):
                 return
             stack.extend(item.child(i) for i in range(item.childCount()))
 
+    def _apply_model_column_visibility(self) -> None:
+        """Show one column per model with stored results, hide the rest.
+
+        A model whose analysis coverage is zero anywhere in the library has
+        nothing to display (no ✓, no ✗, no percentages) — its column is
+        hidden so the visible roster shrinks to the models actually in
+        use.  Columns reappear on the next :meth:`refresh`, or immediately
+        when :meth:`update_track_status` sees the first results for them.
+        """
+        for index, plugin in enumerate(self._plugins):
+            column = MODEL_COLUMN_OFFSET + index
+            self.setColumnHidden(column, plugin.name not in self._covered_models)
+
     def _insert_track(self, folder_item: QTreeWidgetItem, root_path: str,
                       track, embedding_counts: dict[int, dict[str, int]]) -> None:
         """Add ``track`` under ``folder_item`` nested along its real path."""
@@ -253,28 +282,35 @@ class FolderTree(QTreeWidget):
                      model_counts: dict[str, int] | None = None) -> QTreeWidgetItem:
         excluded = ((track["extension"] or "").lower()
                     in self._excluded_extensions)
-        glyph = (_MODEL_EXCLUDED if excluded
-                 else _STATUS_GLYPH.get(track["status"], "•"))
-        cells = ([track["filename"], glyph]
-                 + [""] * len(self._plugins))
+        cells = [track["filename"]] + [""] * len(self._plugins)
         item = QTreeWidgetItem(cells)
         item.setData(0, TRACK_ROLE, int(track["id"]))
+        item.setData(0, PATH_ROLE, track["path"])
         item.setData(0, EXCLUDED_ROLE, excluded)
-        item.setToolTip(0, track["path"])
+        item.setToolTip(0, self._track_tooltip(track["status"],
+                                               track["status_message"],
+                                               track["path"], excluded))
         if excluded:
             self._apply_excluded_look(item)
         if (os.path.normpath(track["path"]) in self._analyzing_paths):
             # Currently under analysis: yellow like its folder chain (the
             # chain itself is painted by _apply_highlights).
             item.setBackground(0, _ACTIVITY_BRUSH)
-        status = track["status"] + (
-            f" — {track['status_message']}" if track["status_message"] else "")
-        if excluded:
-            status += (" — excluded from analysis (WAV files are excluded "
-                       "by default; enable analyze_wav in the config)")
-        item.setToolTip(1, status)
         self._apply_model_columns(item, track["status"], model_counts or {})
         return item
+
+    @staticmethod
+    def _track_tooltip(status: str, status_message: str | None,
+                       path: str, excluded: bool) -> str:
+        """Column-0 tooltip of a track: the full path (first line) plus the
+        overall analysis state that used to live in the removed Status
+        column."""
+        tip = path
+        state = status + (f" — {status_message}" if status_message else "")
+        if excluded:
+            state += (" — excluded from analysis (WAV files are excluded "
+                      "by default; enable analyze_wav in the config)")
+        return f"{tip}\n{state}"
 
     def _apply_excluded_look(self, item: QTreeWidgetItem) -> None:
         """Grey out a track item that is not subject to analysis.
@@ -287,7 +323,7 @@ class FolderTree(QTreeWidget):
         font = item.font(0)
         font.setItalic(True)
         item.setFont(0, font)
-        for column in range(2 + len(self._plugins)):
+        for column in range(1 + len(self._plugins)):
             item.setForeground(column, grey)
 
     def _apply_model_columns(self, item: QTreeWidgetItem, status: str,
@@ -440,25 +476,22 @@ class FolderTree(QTreeWidget):
 
         Unlike :meth:`refresh` — which rebuilds the whole tree and thereby
         resets the user's selection, expansion states and scroll position —
-        this rewrites the track item's column-1 glyph and tooltip (same
-        format as a fresh build: ``status``, plus ``" — message"`` when a
-        message is given; column-0 tooltip keeps the path), refreshes the
-        per-model status columns (2..) from the stored chunk embeddings and
-        recomputes the analysis-progress percentages of its ancestor
-        folder/root nodes in every status column.  A track that is not in
-        the tree is a no-op.
+        this rewrites the track item's column-0 tooltip (same format as a
+        fresh build: path, then ``status``, plus ``" — message"`` when a
+        message is given), refreshes the per-model status columns (1..)
+        from the stored chunk embeddings, recomputes the analysis-progress
+        percentages of its ancestor folder/root nodes in every model
+        column and re-reveals model columns whose first results just
+        arrived (they start hidden — see :meth:`refresh`).  A track that
+        is not in the tree is a no-op.
         """
         item = self._find_track_item(self.invisibleRootItem(), int(track_id))
         if item is None:
             return
         excluded = bool(item.data(0, EXCLUDED_ROLE))
-        item.setText(1, _MODEL_EXCLUDED if excluded
-                     else _STATUS_GLYPH.get(status, "•"))
-        tip = status + (f" — {status_message}" if status_message else "")
-        if item.data(0, EXCLUDED_ROLE):
-            tip += (" — excluded from analysis (WAV files are excluded "
-                    "by default; enable analyze_wav in the config)")
-        item.setToolTip(1, tip)
+        path = str(item.data(0, PATH_ROLE) or item.toolTip(0))
+        item.setToolTip(0, self._track_tooltip(status, status_message,
+                                               path, excluded))
         if item.data(0, EXCLUDED_ROLE):
             self._apply_excluded_look(item)
         conn = self._db.connect()
@@ -467,6 +500,12 @@ class FolderTree(QTreeWidget):
         finally:
             conn.close()
         self._apply_model_columns(item, status, counts)
+        # First results for a so-far-uncovered model: reveal its column at
+        # once instead of waiting for the post-run refresh().
+        for index, plugin in enumerate(self._plugins):
+            if int(counts.get(plugin.name, 0)) > 0:
+                self.setColumnHidden(MODEL_COLUMN_OFFSET + index, False)
+                self._covered_models.add(plugin.name)
         self._update_ancestor_statuses(item)
 
     def _update_folder_statuses(self) -> None:
@@ -492,16 +531,16 @@ class FolderTree(QTreeWidget):
     def _subtree_status_counts(
         self, item: QTreeWidgetItem
     ) -> list[tuple[int, int]]:
-        """Count ``(ready, total)`` per status column in *item*'s subtree.
+        """Count ``(ready, total)`` per model column in *item*'s subtree.
 
-        One entry per status column — index 0 for the overall column 1, then
-        one per registered model plugin (columns ``MODEL_COLUMN_OFFSET..``).
-        Folder statuses nested inside the subtree are recomputed and written
-        in the same bottom-up pass.  A file counts as ready in a column when
-        the glyph shown in that column says so (``✓``) — the tree is the
-        source of truth for display, independent of the database.
+        One entry per registered model plugin (columns
+        ``MODEL_COLUMN_OFFSET..``).  Folder statuses nested inside the
+        subtree are recomputed and written in the same bottom-up pass.  A
+        file counts as ready in a column when the glyph shown in that
+        column says so (``✓``) — the tree is the source of truth for
+        display, independent of the database.
         """
-        ready = [[0, 0] for _ in range(1 + len(self._plugins))]
+        ready = [[0, 0] for _ in range(len(self._plugins))]
         for i in range(item.childCount()):
             child = item.child(i)
             if child.data(0, EXCLUDED_ROLE):
@@ -522,8 +561,8 @@ class FolderTree(QTreeWidget):
 
     def _write_folder_statuses(self, item: QTreeWidgetItem,
                                counts: list[tuple[int, int]]) -> None:
-        """Write *item*'s folder status columns/tooltips from per-column
-        ``counts`` (overall first, then one entry per model plugin).
+        """Write *item*'s folder status columns/tooltips from per-model
+        ``counts`` (one entry per model plugin).
 
         Each column shows the analysis progress as a bare percentage
         (``"{pct}%"``) — the exact ``ready/total`` counts live in the cell
@@ -531,27 +570,15 @@ class FolderTree(QTreeWidget):
         (``ready == total > 0``) additionally gets the dark-green
         :data:`_COMPLETE_GREEN` foreground; any other state clears it again,
         so folders revert when a new file appears or a file flips back to
-        non-analysed.  Only the status columns are coloured — the folder
+        non-analysed.  Only the model columns are coloured — the folder
         name in column 0 keeps its plain look (and the yellow scan
         background) untouched.
         """
-        # Column 1 (overall) first.
-        ready, total = counts[0]
-        if total <= 0:
-            item.setText(1, "")
-            item.setToolTip(1, "")
-            item.setForeground(1, QBrush())
-        else:
-            item.setText(1, f"{ready / total * 100:.0f}%")
-            item.setToolTip(1, f"{ready} of {total} files analyzed")
-            item.setForeground(
-                1, QBrush(_COMPLETE_GREEN) if ready == total else QBrush())
-        # One percentage cell per model plugin column.
         for index, plugin in enumerate(self._plugins):
-            if index + 1 >= len(counts):   # defensive: shorter counts list
+            if index >= len(counts):   # defensive: shorter counts list
                 break
             column = MODEL_COLUMN_OFFSET + index
-            m_ready, m_total = counts[index + 1]
+            m_ready, m_total = counts[index]
             if m_total <= 0:
                 item.setText(column, "")
                 item.setToolTip(column, "")
@@ -601,15 +628,17 @@ class FolderTree(QTreeWidget):
 
         walk(self.invisibleRootItem(), 0)
 
-        # Size the status columns first (clamped: a "12/34 (35%)" cell or a
-        # short header label must not eat the whole pane), then give column 0
-        # whatever viewport width is left over.
+        # Size the visible model columns first (clamped: a percentage cell
+        # or a short header label must not eat the whole pane), then give
+        # column 0 whatever viewport width is left over.  Columns hidden by
+        # the zero-coverage rule take no space at all.
         reserved = 0
         for column in range(1, self.columnCount()):
+            if self.isColumnHidden(column):
+                continue
             self.resizeColumnToContents(column)
-            limit = (_STATUS_COLUMN_MAX_WIDTH if column == 1
-                     else _MODEL_COLUMN_MAX_WIDTH)
-            width = min(self.header().sectionSize(column), limit)
+            width = min(self.header().sectionSize(column),
+                        _MODEL_COLUMN_MAX_WIDTH)
             self.header().resizeSection(column, width)
             reserved += width + 1
 
@@ -620,6 +649,13 @@ class FolderTree(QTreeWidget):
         scrollbar = (self.verticalScrollBar().width()
                      if self.verticalScrollBar().isVisible() else 0)
         budget = max(self.width() - 2 * self.frameWidth() - scrollbar, 200)
+
+        # The model roster keeps growing: per-model columns keep their
+        # natural content width.  When their total exceeds the pane the
+        # tree simply grows a HORIZONTAL scrollbar — the user scrolls to
+        # see the analysis columns they care about, nothing is squeezed
+        # or hidden.  Column 0 still gets the leftover viewport width when
+        # there is any, with the minimum as a floor.
         cap = max(budget - reserved, _NAME_MIN_WIDTH)
         width = max(min(needed, cap), 120)
         self.header().resizeSection(0, width)
@@ -684,7 +720,8 @@ class FolderTree(QTreeWidget):
             if self._paint_activity(item.child(i), False):
                 subtree_has = True
         if item.data(0, TRACK_ROLE) is not None:
-            subtree_has = (os.path.normpath(str(item.toolTip(0)))
+            subtree_has = (os.path.normpath(str(item.data(0, PATH_ROLE)
+                                                  or item.toolTip(0)))
                            in self._analyzing_paths)
         if subtree_has or scanning_root:
             item.setBackground(0, _ACTIVITY_BRUSH)
@@ -774,7 +811,8 @@ class FolderTree(QTreeWidget):
         if item is None:
             return None
         if item.data(0, TRACK_ROLE) is not None:
-            return Path(item.toolTip(0)).parent
+            path = str(item.data(0, PATH_ROLE) or item.toolTip(0))
+            return Path(path).parent
         path = item.data(0, DIR_ROLE)
         if path is None:   # library root folder: text(0) is the full path
             return Path(item.text(0))

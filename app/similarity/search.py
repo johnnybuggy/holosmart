@@ -15,7 +15,8 @@ from app.similarity.ollama import OllamaClient, OllamaError
 log = logging.getLogger(__name__)
 
 #: Audio-model methods tried by ``auto``, in preference order.
-_MODEL_ORDER = ("clap", "mert", "mert330", "openl3", "fft")
+_MODEL_ORDER = ("clap", "mert", "mert330", "m2dclap", "muq", "muqlan",
+                "lpmc", "qwen2audio", "openl3", "fft")
 
 __all__ = [
     "SimilarResult",

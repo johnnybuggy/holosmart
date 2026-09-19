@@ -8,7 +8,7 @@ Colours come from the widget palette, so night/dark mode stays readable.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QToolTip, QWidget
 
@@ -40,7 +40,12 @@ def _format_tick(value: float) -> str:
 
 
 class ScatterCanvas(QWidget):
-    """Plain-painter 2-D scatter with hover tooltips and axis labels."""
+    """Plain-painter 2-D scatter with hover tooltips, click picking and
+    axis labels."""
+
+    #: The user clicked a dot (single click, within :data:`_PICK_RADIUS`);
+    #: the argument is the point's index in the plotted arrays.
+    point_clicked = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -248,6 +253,24 @@ class ScatterCanvas(QWidget):
         self._poly_size = (self.width(), self.height())
 
     # ---- interaction --------------------------------------------------------
+    def _nearest_point(self, x: float, y: float) -> int:
+        """Index of the plotted point nearest to *(x, y)* pixel coords, or
+        ``-1`` when nothing lies within :data:`_PICK_RADIUS`."""
+        if not self._xs.size or self._px is None:
+            return -1
+        deltas = self._px - np.array([x, y])
+        distances = np.hypot(deltas[:, 0], deltas[:, 1])
+        nearest = int(np.argmin(distances))
+        return nearest if distances[nearest] <= _PICK_RADIUS else -1
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            index = self._nearest_point(pos.x(), pos.y())
+            if index >= 0:
+                self.point_clicked.emit(index)
+        super().mousePressEvent(event)
+
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         if self._xs.size and self._px is not None:
             pos = event.position()

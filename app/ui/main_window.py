@@ -8,8 +8,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QFileDialog, QInputDialog, QLabel, QMainWindow, QMessageBox, QProgressBar,
-    QSplitter, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QInputDialog, QLabel, QMainWindow, QMessageBox,
+    QProgressBar, QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
 
 from app.config import DB_PATH, AppConfig
@@ -19,11 +19,14 @@ from app.fs_utils import ACCESS_HELP_TEXT, check_read_access, open_privacy_setti
 from app.playlist.generator import default_m3u_path, export_m3u
 from app.ui.detail_pane import DetailPane
 from app.ui.folder_tree import LibraryPane
+from app.ui.player import PlayerBar
 from app.ui.settings_dialog import rank_embedding_models
 from app.ui.system_player import open_in_system_player
 from app.ui.workers import (
     AnalysisWorker, NoiseFilterWorker, OllamaDetectWorker, ScanWorker,
     SimilarSearchWorker,
+    NoiseSweepWorker,
+    NoiseSweepWorker,
 )
 
 log = logging.getLogger(__name__)
@@ -72,11 +75,15 @@ class MainWindow(QMainWindow):
         self._viz_dialog: "VisualisationDialog | None" = None
 
         self.setWindowTitle("HoloSmart Music Explorer")
-        # Wide enough that the tree pane shows the filename column AND the
-        # whole status area (Status + one column per model plugin) without
-        # horizontal scrolling; _autosize_name_column keeps its end of the
-        # bargain by capping the filename column to the leftover width.
-        self.resize(1500, 940)
+        # Start as large as the desktop allows (menu bar / Dock excluded)
+        # while staying a normal, resizable window — not maximized, so the
+        # title bar and window controls behave exactly as the user expects.
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        if available is not None and available.isValid() and available.width() >= 800:
+            self.setGeometry(available)
+        else:   # exotic/offscreen environments: a sane fixed fallback
+            self.resize(1500, 940)
         self._build_toolbar()
         self._build_central()
         self._build_statusbar()
@@ -102,19 +109,36 @@ class MainWindow(QMainWindow):
         self._details.folder_references_requested.connect(
             self._on_add_folder_references)
         self._details.noise_filter_toggled.connect(self._on_noise_filter_toggled)
+        self._details.noise_sweep_requested.connect(
+            self._on_noise_sweep_requested)
         self._details.playlist_requested.connect(self._on_create_playlist)
         self._details.playlist_play_requested.connect(
             self._on_create_playlist_and_play)
         self._details.play_track_requested.connect(self._on_play_track)
         self._tree.track_play_requested.connect(self._on_play_track)
         self._details.playlist_changed.connect(lambda: None)
+        # The tabs pane must be free to shrink: an explicit minimum width
+        # overrides the QTabWidget's layout-driven minimumSizeHint (the
+        # Similar tab's controls row is wide), so the splitter can travel
+        # further right and give the file tree the room.  The panes'
+        # tables simply scroll at narrow widths.
+        self._details.setMinimumWidth(340)
         splitter.addWidget(self._details)
         splitter.setSizes([620, 880])
+        # extra window width flows to the tabs pane, never the tree
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.addWidget(splitter)
+        # Built-in player: chunks play on click in the Chunks tab.
+        self._player = PlayerBar()
+        self._player.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                   QSizePolicy.Policy.Maximum)
+        self._details.chunk_play_requested.connect(self._player.play_chunk)
+        layout.addWidget(self._player)
         self.setCentralWidget(central)
 
     def _build_toolbar(self) -> None:
@@ -846,6 +870,52 @@ class MainWindow(QMainWindow):
         worker.failed.connect(on_failed)
         worker.start()
 
+    def _on_noise_sweep_requested(self) -> None:
+        """Find outliers button: incremental HDBSCAN + OPTICS pass.
+
+        Only tracks not yet clustered for (dataset, method) are judged —
+        newly analyzed songs, and re-analyzed songs whose chunks changed.
+        Nothing here is automatic: analysis runs never touch noise flags.
+        """
+        from PySide6.QtWidgets import QProgressDialog
+
+        progress = QProgressDialog(
+            "Looking for tracks to cluster…", "", 0, 100, self)
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumWidth(420)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        worker = NoiseSweepWorker(self._db_path, parent=self)
+        self._noise_sweep_worker = worker   # keep alive
+
+        def on_stage(text: str) -> None:
+            progress.setLabelText(text)
+
+        def on_ok(results: list) -> None:
+            progress.close()
+            if not results:
+                self._status("Find outliers: nothing to do — every "
+                             "analyzed track is already clustered.")
+                return
+            parts = [f"{r['dataset']}/{r['method'].upper()}: "
+                     f"{r['n_refit_tracks']} song(s), "
+                     f"{r['n_noise']} chunk(s) flagged"
+                     for r in results]
+            self._status("Outliers updated — " + "; ".join(parts) + ".")
+            self._details.refresh_chunks()   # highlight the new outliers
+
+        def on_failed(message: str) -> None:
+            progress.close()
+            self._status(message)
+
+        worker.stage.connect(on_stage)
+        worker.progress.connect(progress.setValue)
+        worker.finished_ok.connect(on_ok)
+        worker.failed.connect(on_failed)
+        worker.start()
+
     def _on_similar_results(self, results: list) -> None:
         self._details.show_similar_results(results)
         if results:
@@ -933,6 +1003,16 @@ class MainWindow(QMainWindow):
             self._status(f"Could not play {row['filename']} — no default "
                          "player is registered for this file type.")
 
+    def _on_play_path(self, path: str) -> None:
+        """Open an audio file (e.g. the track under a clicked scatter dot)
+        in the system default music player."""
+        if open_in_system_player(path):
+            self._status(f"Playing {os.path.basename(path)} in the "
+                         "system player.")
+        else:
+            self._status(f"Could not play {os.path.basename(path)} — no "
+                         "default player is registered for this file type.")
+
     def export_playlist(self, playlist_id: int) -> None:
         out, _ = QFileDialog.getSaveFileName(self, "Export playlist",
                                              "playlist.m3u", "M3U playlist (*.m3u)")
@@ -953,6 +1033,9 @@ class MainWindow(QMainWindow):
         if self._viz_dialog is None:
             self._viz_dialog = VisualisationDialog(self._db, self._config,
                                                    self)
+            # Clicking a dot plays the audio under it.
+            self._viz_dialog.play_track_path_requested.connect(
+                self._on_play_path)
         self._viz_dialog.refresh_and_plot()
         self._viz_dialog.show()
         self._viz_dialog.raise_()

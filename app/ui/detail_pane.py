@@ -3,17 +3,22 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QSizePolicy
 from PySide6.QtWidgets import (
-    QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
-    QCheckBox,
+    QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
+    QTextEdit, QVBoxLayout, QWidget, QCheckBox,
 )
 
 from app.audio.chunking import format_duration, format_size
 from app.db import repo
 from app.db.database import Database
 from app.models.registry import plugin_info
+
+import logging
+
+log = logging.getLogger(__name__)
 
 _META_ROWS = [
     ("filename", "Filename"), ("path", "Path"), ("size_bytes", "Size"),
@@ -74,6 +79,13 @@ class DetailPane(QTabWidget):
     folder_references_requested = Signal()   # dataset, method, on
     playlist_requested = Signal(list, str)     # [(track_id, score)...], method
     playlist_changed = Signal()                # a playlist was created/deleted
+    #: A chunk's index cell was clicked in the Chunks tab: play exactly
+    #: that chunk in the built-in player (path, start_sec, end_sec).
+    chunk_play_requested = Signal(str, float, float)
+    #: "Find outliers" pressed in the Chunks tab: cluster the chunks of
+    #: tracks not yet clustered (newly/re-analyzed) for every covered
+    #: model, both methods.  Nothing runs automatically any more.
+    noise_sweep_requested = Signal()
     # Double-clicked a similar-results row (or a tree track): play the file
     # in the system player.
     play_track_requested = Signal(int)
@@ -86,6 +98,9 @@ class DetailPane(QTabWidget):
         self._db = db
         self._config = config
         self._current_track_id: int | None = None
+        # Track id whose reference list the user deliberately cleared: the
+        # auto-fill stays suppressed for it until the selection changes.
+        self._cleared_track_id: int | None = None
         self._similar_cache: list[tuple[int, float]] = []
 
         self.addTab(self._build_overview_tab(), "Overview")
@@ -140,27 +155,25 @@ class DetailPane(QTabWidget):
         self._chunks_hint.setWordWrap(True)
         hint_row.addWidget(self._chunks_hint, 1)
 
-        # Noise-filter controls (moved here from the Similar tab): they
-        # toggle the cached per-dataset outlier filters, color the flagged
-        # chunks in this table, and the checked ones also feed the Similar
-        # tab's searches (discard_noise).
-        hint_row.addWidget(QLabel("Noise filter:"))
-        self._noise_checks: dict[str, QCheckBox] = {}
-        for method, label, color in _NOISE_METHOD_COLORS:
-            checkbox = QCheckBox(label)
-            checkbox.setToolTip(
-                f"Discard chunks that a one-time {label} clustering flags "
-                "as noise before comparing (junk chunks — silence, fades, "
-                "transitions — skew chunk-level results). Checking it for "
-                "a dataset without cached noise data starts that "
-                "clustering run in the background; flagged chunks are "
-                "highlighted in this table.")
-            checkbox.toggled.connect(
-                lambda on, m=method: self._on_noise_toggled(m, on))
-            self._noise_checks[method] = checkbox
-            hint_row.addWidget(checkbox)
+        # Outlier highlighting in this table is UNCONDITIONAL: whichever
+        # noise runs exist (per model + method), this table tints the
+        # flagged chunks — no checkbox gates that.  Clustering is
+        # BUTTON-driven (below) and incremental — only tracks not yet
+        # clustered are judged.  The HDBSCAN/OPTICS checkboxes live on
+        # the Similar tab and decide whether noise chunks are DISCARDED
+        # from searches.
+        self._noise_sweep_button = QPushButton("Find outliers")
+        self._noise_sweep_button.setToolTip(
+            "Cluster the chunks of newly analyzed tracks (and "
+            "re-analyzed tracks whose chunks changed) with HDBSCAN + "
+            "OPTICS for every model.  Tracks already clustered are "
+            "skipped — nothing runs automatically after analysis.")
+        self._noise_sweep_button.clicked.connect(
+            self.noise_sweep_requested.emit)
+        hint_row.addWidget(self._noise_sweep_button, 0)
         hint_row.addStretch(1)
         layout.addLayout(hint_row)
+        self._noise_checks: dict[str, QCheckBox] = {}
         self._chunks_table = QTableWidget()
         self._chunks_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._chunks_table.setAlternatingRowColors(True)
@@ -171,6 +184,8 @@ class DetailPane(QTabWidget):
         # map and row->chunk list are (re)built by _refresh_chunks.
         self._chunks_model_columns: dict[int, str] = {}
         self._chunks_chunk_ids: list[int] = []
+        self._chunks_table.cellClicked.connect(
+            self._on_chunk_cell_clicked)
         self._chunks_table.cellDoubleClicked.connect(
             self._on_chunk_cell_double_clicked)
         layout.addWidget(self._chunks_table)
@@ -213,29 +228,35 @@ class DetailPane(QTabWidget):
         # which chunk each row is (see _on_chunk_cell_double_clicked).
         self._chunks_model_columns = {4 + i: m for i, m in enumerate(models)}
         self._chunks_chunk_ids = [int(c["id"]) for c in chunks]
+        # Chunk playback: the file and the per-row [start, end] seconds.
+        self._chunks_track_path = str(track["path"]) if track else None
+        self._chunks_ranges = [(float(chunk["start_sec"]),
+                                float(chunk["end_sec"]))
+                               for chunk in chunks]
         for offset, name in enumerate(extra):
             tip = f"⚠ {display.get(name, name)}: no results"
             if missing[name]:
                 tip += f" — {missing[name]}"
             self._chunks_table.horizontalHeaderItem(
                 4 + len(models) + offset).setToolTip(tip)
-        # Outlier highlighting: chunks the CHECKED noise filters flag for
-        # the current dataset context get their row tinted with that
-        # method's color (both -> blend color).
+        # Outlier highlighting is UNCONDITIONAL (every analysis run
+        # re-clusters every covered model — HDBSCAN + OPTICS — so flags
+        # are always current): flagged chunks get their row tinted with
+        # the method's color (both -> blend color).  The Similar-tab
+        # checkboxes only decide whether noise is DISCARDED from
+        # searches.
         flagged: dict[str, set[int]] = {}
         try:
-            noise_methods = self._noise_methods()
-        except AttributeError:
-            noise_methods = ()
-        if noise_methods:
             from app.similarity.noise_filter import noise_ids_for
 
             with self._db.transaction() as nconn:
-                for method in noise_methods:
+                for method, _label, _color in _NOISE_METHOD_COLORS:
                     # "auto" pools EVERY stored run of the method: the
                     # grid shows outliers regardless of which dataset the
                     # Similar tab has selected.
                     flagged[method] = noise_ids_for(nconn, "auto", (method,))
+        except ImportError:
+            flagged = {}
         row_color: dict[int, str] = {}
         for method, ids in flagged.items():
             for chunk_id in ids:
@@ -250,9 +271,16 @@ class DetailPane(QTabWidget):
         for r, chunk in enumerate(chunks):
             tags = repo.get_chunk_tags(conn, chunk["id"])
             by_model: dict[str, list[str]] = {}
+            import math
+
             for tag in tags:
+                score = float(tag["score"])
+                # Weights live in [0, 1]; the interesting dynamic range is
+                # in the tail — show log10 so 0.001 doesn't round to 0.00.
+                shown = ("— (score 0)" if score <= 0.0
+                         else f"{math.log10(score):.2f}")
                 by_model.setdefault(tag["model"], []).append(
-                    f"{tag['text']} {tag['score']:.2f}")
+                    f"{tag['text']} {shown}")
             tag_text = "; ".join(f"{m}: {', '.join(items)}"
                                  for m, items in by_model.items()) or "—"
             values = [str(chunk["idx"]), f"{chunk['start_sec']:.2f} s",
@@ -281,11 +309,16 @@ class DetailPane(QTabWidget):
                         "Double-click for the full vector values and "
                         "dimension names.")
                 self._chunks_table.setItem(r, c, item)
+            play_tip = (f"Click to play this chunk "
+                        f"({chunk['start_sec']:.2f} – "
+                        f"{chunk['end_sec']:.2f} s) in the built-in player.")
+            self._chunks_table.item(r, 0).setToolTip(play_tip)
             if color is not None:
                 methods_hit = [labels[m] for m in flagged
                                if int(chunk["id"]) in flagged[m]]
                 self._chunks_table.item(r, 0).setToolTip(
-                    "Noise outlier: " + " + ".join(methods_hit))
+                    "Noise outlier: " + " + ".join(methods_hit)
+                    + "\n" + play_tip)
         self._chunks_table.resizeColumnsToContents()
         self._chunks_table.setColumnWidth(3, 360)
 
@@ -341,6 +374,25 @@ class DetailPane(QTabWidget):
         self._search_button = QPushButton("Search")
         self._search_button.clicked.connect(self._on_search)
         controls.addWidget(self._search_button)
+        controls.addSpacing(10)
+        # Noise-filter toggles (moved here from the Chunks tab): they
+        # decide whether chunks flagged as noise outliers are DISCARDED
+        # from searches.  The Chunks tab always TINTS those chunks in
+        # this detector's color, checkbox or not.
+        controls.addWidget(QLabel("Discard noise:"))
+        self._noise_checks: dict[str, QCheckBox] = {}
+        for method, label, _color in _NOISE_METHOD_COLORS:
+            checkbox = QCheckBox(label)
+            checkbox.setToolTip(
+                f"Discard chunks that the one-time {label} clustering "
+                "flags as noise outliers before comparing (junk chunks — "
+                "silence, fades, transitions — skew chunk-level results). "
+                "The Chunks tab highlights those chunks regardless of "
+                "this checkbox.")
+            checkbox.toggled.connect(
+                lambda on, m=method: self._on_noise_toggled(m, on))
+            self._noise_checks[method] = checkbox
+            controls.addWidget(checkbox)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -356,26 +408,31 @@ class DetailPane(QTabWidget):
             "selected in the tree; add more with 'Add selected'. Results "
             "rank by the geometric mean of the per-reference match "
             "percentages, so a track must be similar to ALL references.")
-        self._seed_list.setMaximumHeight(96)
+        self._seed_list.setMaximumHeight(64)
+        self._seed_list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         refs_layout.addWidget(self._seed_list, 1)
-        seed_buttons = QVBoxLayout()
+        # The four buttons live in a compact 2x2 grid: a tall button column
+        # would dictate the box height and eat the results table's space.
+        seed_buttons = QGridLayout()
         self._seed_add_button = QPushButton("Add selected")
         self._seed_add_button.setToolTip(
             "Append the file currently selected in the tree as another "
             "reference for the similarity search.")
         self._seed_add_button.clicked.connect(self._on_add_seed)
-        seed_buttons.addWidget(self._seed_add_button)
+        seed_buttons.addWidget(self._seed_add_button, 0, 0)
         self._seed_remove_button = QPushButton("Remove")
         self._seed_remove_button.setToolTip(
             "Remove the highlighted reference from the list.")
         self._seed_remove_button.clicked.connect(self._on_remove_seed)
-        seed_buttons.addWidget(self._seed_remove_button)
+        seed_buttons.addWidget(self._seed_remove_button, 0, 1)
         self._seed_clear_button = QPushButton("Clear")
         self._seed_clear_button.setToolTip(
-            "Empty the reference list (the selected file is re-added "
-            "automatically).")
+            "Empty the reference list. The currently selected file is NOT "
+            "re-added automatically; picking another file in the tree "
+            "resumes the auto-fill.")
         self._seed_clear_button.clicked.connect(self._on_clear_seeds)
-        seed_buttons.addWidget(self._seed_clear_button)
+        seed_buttons.addWidget(self._seed_clear_button, 1, 0)
         self._seed_folder_button = QPushButton("Add folder…")
         self._seed_folder_button.setToolTip(
             "Add every track of the folder selected in the tree (or of the "
@@ -383,10 +440,15 @@ class DetailPane(QTabWidget):
             "vectors in the search dataset are skipped during the search.")
         self._seed_folder_button.clicked.connect(
             self.folder_references_requested.emit)
-        seed_buttons.addWidget(self._seed_folder_button)
-        seed_buttons.addStretch(1)
+        seed_buttons.addWidget(self._seed_folder_button, 1, 1)
+        seed_buttons.setContentsMargins(0, 0, 0, 0)
         refs_layout.addLayout(seed_buttons)
+        # Maximum vertical policy: the box shrinks to its content and never
+        # grows into the results table's space, whatever the window size.
+        refs_box.setSizePolicy(QSizePolicy.Policy.Maximum,
+                               QSizePolicy.Policy.Maximum)
         layout.addWidget(refs_box)
+        self._refs_box = refs_box
         self._auto_seed_id: int | None = None
 
         self._populate_dataset_combo()
@@ -426,6 +488,14 @@ class DetailPane(QTabWidget):
         self._playlist_play_button.clicked.connect(
             self._on_create_playlist_and_play)
         actions.addWidget(self._playlist_play_button)
+        self._copy_button = QPushButton("Copy files…")
+        self._copy_button.setEnabled(False)
+        self._copy_button.setToolTip(
+            "Copy the files of these search results into a folder you "
+            "pick — identical copies already there are skipped, colliding "
+            "differing files get 'name (2)' style names.")
+        self._copy_button.clicked.connect(self._on_copy_results)
+        actions.addWidget(self._copy_button)
         actions.addStretch(1)
         layout.addLayout(actions)
         return page
@@ -445,13 +515,26 @@ class DetailPane(QTabWidget):
                      if self._noise_checks[method].isEnabled()
                      and self._noise_checks[method].isChecked())
 
+    def _on_chunk_cell_clicked(self, row: int, column: int) -> None:
+        """Click the chunk's number (column 0) → play exactly that chunk."""
+        if column != 0 or not self._chunks_track_path:
+            return
+        if 0 <= row < len(self._chunks_ranges):
+            start, end = self._chunks_ranges[row]
+            self.chunk_play_requested.emit(self._chunks_track_path,
+                                           start, end)
+
     def _on_chunk_cell_double_clicked(self, row: int, column: int) -> None:
-        """Double-click a model cell: dialog with the chunk's full vector."""
-        model = self._chunks_model_columns.get(column)
-        if model is None or not 0 <= row < len(self._chunks_chunk_ids):
+        """Double-click: model cell -> the chunk's full vector; any other
+        cell -> every tag the chunk has."""
+        if not 0 <= row < len(self._chunks_chunk_ids):
             return
         chunk_id = self._chunks_chunk_ids[row]
-        self._show_chunk_vector_dialog(chunk_id, model)
+        model = self._chunks_model_columns.get(column)
+        if model is not None:
+            self._show_chunk_vector_dialog(chunk_id, model)
+        else:
+            self._show_chunk_tags_dialog(chunk_id)
 
     def _show_chunk_vector_dialog(self, chunk_id: int, model: str) -> None:
         """Modal read-out of every dimension of one chunk embedding."""
@@ -498,6 +581,66 @@ class DetailPane(QTabWidget):
             "Values as stored for this chunk (L2-normalized per chunk).")
         note.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _show_chunk_tags_dialog(self, chunk_id: int) -> None:
+        """Modal read-out of ALL tags stored for one chunk (any model)."""
+        import math
+
+        from PySide6.QtWidgets import (
+            QDialog, QDialogButtonBox, QHeaderView, QTableWidget,
+            QVBoxLayout,
+        )
+
+        conn = self._db.connect()
+        try:
+            tags = repo.get_chunk_tags(conn, chunk_id)
+        finally:
+            conn.close()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Chunk #{chunk_id} — all tags "
+                              f"({len(tags)})")
+        dialog.setMinimumSize(460, 420)
+        layout = QVBoxLayout(dialog)
+        if tags:
+            table = QTableWidget(len(tags), 3)
+            table.setHorizontalHeaderLabels(
+                ["Model", "Tag", "Score (log10)"])
+            table.horizontalHeader().setSectionResizeMode(
+                1, QHeaderView.ResizeMode.Stretch)
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            for r, tag in enumerate(tags):
+                score = float(tag["score"])
+                # Weights live in [0, 1]; the interesting dynamic range is
+                # in the tail — show log10(p) so 0.001 doesn't round to 0.00
+                log10 = math.log10(score) if score > 0.0 else -99.0
+                model_item = QTableWidgetItem(
+                    self._plugin_display_name(str(tag["model"])))
+                tag_item = QTableWidgetItem(str(tag["text"]))
+                score_item = QTableWidgetItem(
+                    "— (score 0)" if score <= 0.0 else f"{log10:.2f}")
+                score_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                for c, item in enumerate((model_item, tag_item, score_item)):
+                    table.setItem(r, c, item)
+            layout.addWidget(table)
+            note = QLabel(
+                "Scores as log10 of the stored weight (closer to 0 = "
+                "more confident; -99 = score 0). Double-click a model's "
+                "column in the Chunks table for that model's vectors.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: gray; font-size: 11px;")
+            layout.addWidget(note)
+        else:
+            empty = QLabel("This chunk has no tags.")
+            empty.setStyleSheet("color: gray;")
+            layout.addWidget(empty)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(dialog.reject)
         buttons.clicked.connect(dialog.accept)
@@ -798,11 +941,16 @@ class DetailPane(QTabWidget):
 
         An empty list gets the selected file; a list holding only the
         previous auto entry follows the selection.  Manually added
-        references are never touched.
+        references are never touched.  A "Clear" press suppresses the
+        auto-fill for the currently selected file (the list stays empty);
+        selecting a different file resumes it.
         """
         tid = self._current_track_id
         if tid is None:
             return
+        if tid == self._cleared_track_id and self._seed_list.count() == 0:
+            return                     # cleared by the user: stay empty
+        self._cleared_track_id = None
         only_auto = (self._seed_list.count() == 1
                      and self._auto_seed_id is not None
                      and self._seed_ids() == [self._auto_seed_id])
@@ -816,6 +964,7 @@ class DetailPane(QTabWidget):
 
         Skips duplicates and unknown tracks; returns how many were added.
         """
+        self._cleared_track_id = None
         added = 0
         for track_id in track_ids:
             if self._append_seed(int(track_id), auto=False):
@@ -825,6 +974,7 @@ class DetailPane(QTabWidget):
     def _on_add_seed(self) -> None:
         if self._current_track_id is None:
             return
+        self._cleared_track_id = None
         self._append_seed(int(self._current_track_id), auto=False)
         # An explicit "Add selected" pins the list: the auto entry stops
         # following the selection (duplicates change nothing but still pin).
@@ -834,15 +984,21 @@ class DetailPane(QTabWidget):
         row = self._seed_list.currentRow()
         if row < 0:
             return
+        self._cleared_track_id = None
         removed = int(self._seed_list.item(row).data(Qt.ItemDataRole.UserRole))
         self._seed_list.takeItem(row)
         if removed == self._auto_seed_id:
             self._auto_seed_id = None
 
     def _on_clear_seeds(self) -> None:
+        # Clear must leave the list EMPTY: the auto entry that normally
+        # mirrors the tree selection is suppressed until the user picks a
+        # different file (or edits the list manually) — otherwise the
+        # freshly cleared list would instantly refill with the very file
+        # still selected in the tree and Clear would look like a no-op.
         self._seed_list.clear()
         self._auto_seed_id = None
-        self._sync_seed_list_with_selection()
+        self._cleared_track_id = self._current_track_id
 
     def _on_search(self) -> None:
         seeds = self._seed_ids()
@@ -874,6 +1030,7 @@ class DetailPane(QTabWidget):
             self._similar_table.setItem(row, 3, score_item)
         self._playlist_button.setEnabled(bool(results))
         self._playlist_play_button.setEnabled(bool(results))
+        self._copy_button.setEnabled(bool(results))
         self._set_similar_status("")
 
     def show_similar_error(self, message: str) -> None:
@@ -881,7 +1038,73 @@ class DetailPane(QTabWidget):
         self._similar_cache = []
         self._playlist_button.setEnabled(False)
         self._playlist_play_button.setEnabled(False)
+        self._copy_button.setEnabled(False)
         self._set_similar_status(f"⚠ {message}", error=True)
+
+    def _result_paths(self) -> list[str]:
+        """The result rows' file paths, deduplicated, in display order."""
+        paths: list[str] = []
+        seen: set[str] = set()
+        for row in range(self._similar_table.rowCount()):
+            item = self._similar_table.item(row, 0)
+            if item is None:
+                continue
+            path = item.text()
+            if path and path not in seen:
+                seen.add(path)
+                paths.append(path)
+        return paths
+
+    def _on_copy_results(self) -> None:
+        """Copy every result file into a user-chosen folder."""
+        paths = self._result_paths()
+        if not paths:
+            return
+        dest_text = QFileDialog.getExistingDirectory(
+            self, "Copy results into folder", "",
+            QFileDialog.Option.ShowDirsOnly)
+        if not dest_text:
+            return
+        import shutil
+        from pathlib import Path
+
+        dest = Path(dest_text)
+        copied = same = renamed = failed = 0
+        for path_text in paths:
+            src_file = Path(path_text)
+            try:
+                if not src_file.is_file():
+                    failed += 1
+                    continue
+                target = dest / src_file.name
+                if target.exists():
+                    if target.stat().st_size == src_file.stat().st_size:
+                        same += 1        # byte-identical copy already there
+                        continue
+                    stem, suffix = src_file.stem, src_file.suffix
+                    counter = 2
+                    while True:
+                        candidate = dest / f"{stem} ({counter}){suffix}"
+                        if not candidate.exists():
+                            break
+                        counter += 1
+                    target = candidate
+                    renamed += 1
+                shutil.copy2(src_file, target)
+                copied += 1
+            except OSError as exc:
+                log.warning("Copy failed for %s: %s", src_file, exc)
+                failed += 1
+        parts = [f"{copied} file(s) copied"]
+        if same:
+            parts.append(f"{same} already present (identical, skipped)")
+        if renamed:
+            parts.append(f"{renamed} renamed (name collision)")
+        if failed:
+            parts.append(f"{failed} failed (missing/unreadable)")
+        summary = "; ".join(parts) + f".\nFolder: {dest}"
+        self._set_similar_status("✓ " + summary.replace("\n", " "))
+        QMessageBox.information(self, "Copy results", summary)
 
     def _set_similar_status(self, text: str, error: bool = False) -> None:
         self._similar_status.setVisible(bool(text))

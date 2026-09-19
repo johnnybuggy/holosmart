@@ -15,7 +15,7 @@ libraries (scikit-learn / umap-learn); PCA is built in.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QVBoxLayout, QWidget,
@@ -47,6 +47,11 @@ def _display_name(model: str) -> str:
 
 
 class VisualisationDialog(QDialog):
+    """Dimensionality-reduced scatter of the library's chunk vectors."""
+
+    #: The user clicked a dot: the argument is the audio file path of the
+    #: track under it (the main window opens it in the system player).
+    play_track_path_requested = Signal(str)
     """Pick X/Y sources (model + component, or a reduction) and plot."""
 
     def __init__(self, db, config, parent: QWidget | None = None) -> None:
@@ -129,6 +134,9 @@ class VisualisationDialog(QDialog):
         layout.addWidget(self._status_label)
 
         self._canvas = ScatterCanvas()
+        # Clicking a dot plays the track underneath it (system player).
+        self._canvas.point_clicked.connect(self._on_point_clicked)
+        self._point_keys: list[tuple] = []
         layout.addWidget(self._canvas, 1)
 
         self._sync_reduction_availability()
@@ -284,6 +292,16 @@ class VisualisationDialog(QDialog):
         else:
             self._plot_reduced(method)
 
+    def _on_point_clicked(self, index: int) -> None:
+        """A dot was clicked: open the audio under it in the player."""
+        if not 0 <= index < len(self._point_keys):
+            return
+        key = self._point_keys[index]
+        track_path, filename = str(key[1]), str(key[2])
+        self._status_label.setText(
+            f"Playing {filename} — the track under the clicked dot.")
+        self.play_track_path_requested.emit(track_path)
+
     def _track_color(self, track_path: str) -> int:
         if track_path not in self._track_colors:
             self._track_colors[track_path] = len(self._track_colors)
@@ -335,6 +353,7 @@ class VisualisationDialog(QDialog):
             keys = [keys[i] for i in keep]
             note = (f"subsampled {_fmt_int(RAW_MAX_POINTS)} of "
                     f"{_fmt_int(total)} points for this method")
+        self._point_keys = list(keys)
         labels = [
             f"{key[2]} — chunk {key[3]} @ {key[4]:.0f}s "
             f"({_display_name(model_x)}[{comp_x}])"
@@ -393,6 +412,7 @@ class VisualisationDialog(QDialog):
         matrix = np.hstack(matrix_parts).astype(np.float64)
         models_label = " + ".join(_display_name(m) for m in chosen)
 
+        self._point_keys = list(order)
         labels = [
             f"{key[2]} — chunk {key[3]} @ {key[4]:.0f}s" for key in order]
         colors = [self._track_color(key[1]) for key in order]

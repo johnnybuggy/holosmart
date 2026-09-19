@@ -636,11 +636,19 @@ class AnalysisWorker(QThread):
         Database-wise and unconditional: no matter which models the run
         used — Analyze All, Analyze Selected, folder / single-file /
         context-menu runs, forced runs, stopped runs — the run ends with
-        re-standardizing ALL stored FFT chunk vectors per component (whole
-        dataset, not just the tracks of this run) and rebuilding the FFT
-        track centroids, see :mod:`app.analysis.normalization`.  A cheap
-        existence check skips the work for libraries without FFT vectors;
-        an already-standardized dataset rewrites nothing (idempotent).
+
+        1. re-standardizing ALL stored FFT chunk vectors per component
+           (whole dataset, not just the tracks of this run) and rebuilding
+           the FFT track centroids, see :mod:`app.analysis.normalization`;
+           a cheap existence check skips the work for libraries without
+           FFT vectors; an already-standardized dataset rewrites nothing
+           (idempotent);
+        2. nothing else — the HDBSCAN/OPTICS noise flags are NOT
+           touched by analysis runs any more; they are re-judged only
+           when the user clicks the Chunks tab's "Find outliers" button
+           (incrementally, for tracks not yet clustered — see
+           :mod:`app.similarity.noise_filter`).
+
         Best-effort: a failure here is logged, never reported as an
         analysis failure.
         """
@@ -654,18 +662,16 @@ class AnalysisWorker(QThread):
             return
         finally:
             conn.close()
-        if n_fft < 2:
-            return   # nothing to standardize
-        try:
-            from app.analysis.normalization import normalize_model
+        if n_fft >= 2:
+            try:
+                from app.analysis.normalization import normalize_model
 
-            n_vectors, n_centroids = normalize_model(db, "fft")
-            if n_vectors:
-                log.info("Post-run FFT normalization: %d vectors, "
-                         "%d centroids", n_vectors, n_centroids)
-        except Exception:
-            log.exception("FFT per-component normalization failed")
-
+                n_vectors, n_centroids = normalize_model(db, "fft")
+                if n_vectors:
+                    log.info("Post-run FFT normalization: %d vectors, "
+                             "%d centroids", n_vectors, n_centroids)
+            except Exception:
+                log.exception("FFT per-component normalization failed")
 
 class OllamaDetectWorker(QThread):
     """Startup probe: is Ollama alive and which embedding models are installed?"""
@@ -931,6 +937,63 @@ class NoiseFilterWorker(QThread):
         except Exception as exc:
             log.exception("Noise filter run failed")
             self.failed.emit(f"Noise filter failed: {exc}")
+
+
+class NoiseSweepWorker(QThread):
+    """Button-driven incremental noise pass over EVERY covered dataset.
+
+    Triggered by the Chunks tab's "Find outliers" button (analysis runs do
+    NOT touch noise flags any more).  For every model dataset that has
+    chunk vectors, only the PENDING songs are re-clustered — tracks not
+    yet clustered, and re-analyzed tracks whose chunk ids changed — with
+    BOTH methods, and the results are merged into the stored filters.
+
+    Signals:
+
+    * ``stage`` — human-readable phase text;
+    * ``progress`` — 0..100;
+    * ``finished_ok`` — list of per-(dataset, method) result dicts;
+    * ``failed`` — friendly error text.
+    """
+
+    stage = Signal(str)
+    progress = Signal(int)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path | str, parent=None) -> None:
+        super().__init__(parent)
+        self._db_path = Path(db_path)
+        # HDBSCAN/OPTICS recurse inside Cython; give the thread more room
+        # than Qt's ~512 KB default (cheap insurance against hard crashes).
+        self.setStackSize(64 * 1024 * 1024)
+
+    def run(self) -> None:
+        # Below-normal scheduling priority: the GUI thread wins CPU
+        # time when an analysis/scan run saturates the machine.
+        self.setPriority(QThread.Priority.LowPriority)
+        try:
+            from app.similarity.noise_filter import fit_noise_filter_pending
+
+            def on_progress(message: str, fraction: float) -> None:
+                self.stage.emit(message)
+                self.progress.emit(
+                    max(0, min(100, int(round(fraction * 100.0)))))
+
+            with Database(self._db_path).connect() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT model FROM embeddings "
+                    "ORDER BY model").fetchall()
+            datasets = [str(r["model"]) for r in rows]
+            results = fit_noise_filter_pending(
+                self._db_path, datasets,
+                progress_cb=on_progress)
+            self.finished_ok.emit(results)
+        except RuntimeError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            log.exception("Noise sweep failed")
+            self.failed.emit(f"Noise sweep failed: {exc}")
 
 
 class LearningWorker(QThread):

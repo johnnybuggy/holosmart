@@ -9,6 +9,10 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import AppConfig
+from app.models.lpmusiccaps_model import (
+    LPMC_CHECKPOINT_FILE, LPMC_MODEL_ID)
+from app.models.muq_model import MUQ_MODEL_ID, MUQ_MULAN_MODEL_ID
+from app.models.qwen2audio_model import QWEN2AUDIO_MODEL_ID
 from app.models.registry import plugin_info
 from app.similarity.ollama import OllamaClient
 
@@ -37,7 +41,8 @@ class SettingsDialog(QDialog):
 
     #: Sidebar entries, in order: (list label, builder method suffix).
     _PAGES = ("General", "Analysis models", "CLAP", "MERT", "MERT-330M",
-              "FFT", "Ollama")
+              "M2D-CLAP", "MuQ", "MuQ-MuLan", "LP-MusicCaps",
+              "Qwen2-Audio", "FFT", "Ollama")
 
     def __init__(self, config: AppConfig, parent=None) -> None:
         super().__init__(parent)
@@ -63,8 +68,10 @@ class SettingsDialog(QDialog):
         builders = (
             self._build_general_page, self._build_models_page,
             self._build_clap_page, self._build_mert_page,
-            self._build_mert330_page, self._build_fft_page,
-            self._build_ollama_page)
+            self._build_mert330_page, self._build_m2dclap_page,
+            self._build_muq_page, self._build_muqlan_page,
+            self._build_lpmc_page, self._build_qwen2audio_page,
+            self._build_fft_page, self._build_ollama_page)
         for label, builder in zip(self._PAGES, builders):
             self._category_list.addItem(label)
             self._pages.addWidget(builder(config))
@@ -267,6 +274,215 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return page
 
+    def _build_m2dclap_page(self, config: AppConfig) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        m2d_box = QGroupBox("M2D-CLAP (audio-language embeddings + tags)")
+        m2d_form = QFormLayout(m2d_box)
+        note = QLabel(
+            "NTT Masked Modeling Duo + CLAP (IEEE Access 2025). 768-d "
+            "audio-language embeddings; the runtime and the ~1.5 GB "
+            "weights are fetched from the official NTT release into "
+            "<data>/models/m2d/ on first use — non-commercial evaluation "
+            "license (see NTT LICENSE.pdf).")
+        note.setWordWrap(True)
+        m2d_form.addRow(note)
+        self._m2dclap_top_k = QSpinBox()
+        self._m2dclap_top_k.setRange(1, 20)
+        self._m2dclap_top_k.setValue(int(config.m2dclap_tag_top_k))
+        m2d_form.addRow("Tag top K:", self._m2dclap_top_k)
+        self._m2dclap_batch = QSpinBox()
+        self._m2dclap_batch.setRange(1, 64)
+        self._m2dclap_batch.setValue(int(config.m2dclap_batch_size))
+        m2d_form.addRow("Batch size:", self._m2dclap_batch)
+        # Candidate-tag editor, same mechanics as the CLAP page.
+        tags_layout = QVBoxLayout()
+        tags_layout.setContentsMargins(0, 0, 0, 0)
+        from app.models.clap_model import CANDIDATE_TAGS
+        self._m2dclap_default_tags = tuple(CANDIDATE_TAGS)
+        self._m2dclap_tags_edit = QPlainTextEdit()
+        self._m2dclap_tags_edit.setPlainText(
+            "\n".join(getattr(config, "m2dclap_tags", None) or CANDIDATE_TAGS))
+        self._m2dclap_tags_edit.setToolTip(
+            "One candidate tag per line — M2D-CLAP scores every chunk "
+            "against this list and reports the top matches (top K). "
+            "Empty lines are ignored. Changing the list takes effect on "
+            "the next analysis run.")
+        self._m2dclap_tags_edit.setMaximumHeight(150)
+        tags_layout.addWidget(self._m2dclap_tags_edit)
+        tag_buttons = QHBoxLayout()
+        self._m2dclap_tags_reset = QPushButton("Restore default list")
+        self._m2dclap_tags_reset.clicked.connect(self._on_reset_m2dclap_tags)
+        tag_buttons.addWidget(self._m2dclap_tags_reset)
+        tag_buttons.addStretch(1)
+        tags_layout.addLayout(tag_buttons)
+        m2d_form.addRow("Candidate tags:", tags_layout)
+        layout.addWidget(m2d_box)
+        layout.addStretch(1)
+        return page
+
+    def _build_muq_page(self, config: AppConfig) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        muq_box = QGroupBox("MuQ (SSL music embeddings, 24 kHz)")
+        muq_form = QFormLayout(muq_box)
+        self._muq_model_combo = QComboBox()
+        self._muq_model_combo.setEditable(True)
+        self._muq_model_combo.addItem(MUQ_MODEL_ID)
+        if config.muq_model_id != MUQ_MODEL_ID:
+            self._muq_model_combo.addItem(config.muq_model_id)
+        self._muq_model_combo.setCurrentText(config.muq_model_id)
+        self._muq_model_combo.setToolTip(
+            "Tencent MuQ (arXiv 2501.01108) — 1024-d self-supervised music "
+            "representations via Mel-RVQ masked modeling; 24 kHz input, "
+            "weights download from Hugging Face on first use.")
+        muq_form.addRow("Model id:", self._muq_model_combo)
+        self._muq_window = QDoubleSpinBox()
+        self._muq_window.setRange(1.0, 30.0)
+        self._muq_window.setDecimals(1)
+        self._muq_window.setSingleStep(1.0)
+        self._muq_window.setValue(float(config.muq_window_sec))
+        muq_form.addRow("Window length (s):", self._muq_window)
+        self._muq_overlap = QDoubleSpinBox()
+        self._muq_overlap.setRange(0.0, 5.0)
+        self._muq_overlap.setDecimals(1)
+        self._muq_overlap.setSingleStep(0.5)
+        self._muq_overlap.setValue(float(config.muq_window_overlap_sec))
+        muq_form.addRow("Window overlap (s):", self._muq_overlap)
+        self._muq_batch = QSpinBox()
+        self._muq_batch.setRange(1, 64)
+        self._muq_batch.setValue(int(config.muq_batch_size))
+        muq_form.addRow("Batch size:", self._muq_batch)
+        layout.addWidget(muq_box)
+        layout.addStretch(1)
+        return page
+
+    def _build_muqlan_page(self, config: AppConfig) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        mulan_box = QGroupBox("MuQ-MuLan (joint music-text embeddings + tags)")
+        mulan_form = QFormLayout(mulan_box)
+        self._muqlan_model_combo = QComboBox()
+        self._muqlan_model_combo.setEditable(True)
+        self._muqlan_model_combo.addItem(MUQ_MULAN_MODEL_ID)
+        if config.muqlan_model_id != MUQ_MULAN_MODEL_ID:
+            self._muqlan_model_combo.addItem(config.muqlan_model_id)
+        self._muqlan_model_combo.setCurrentText(config.muqlan_model_id)
+        self._muqlan_model_combo.setToolTip(
+            "MuQ-MuLan — CLIP-like joint music/text embedding space "
+            "(512-d, English and Chinese captions, trained on ~10 s "
+            "clips). Long chunks are analyzed in 10 s windows and pooled.")
+        mulan_form.addRow("Model id:", self._muqlan_model_combo)
+        self._muqlan_window = QDoubleSpinBox()
+        self._muqlan_window.setRange(1.0, 30.0)
+        self._muqlan_window.setDecimals(1)
+        self._muqlan_window.setSingleStep(1.0)
+        self._muqlan_window.setValue(float(config.muqlan_window_sec))
+        mulan_form.addRow("Window length (s):", self._muqlan_window)
+        self._muqlan_overlap = QDoubleSpinBox()
+        self._muqlan_overlap.setRange(0.0, 5.0)
+        self._muqlan_overlap.setDecimals(1)
+        self._muqlan_overlap.setSingleStep(0.5)
+        self._muqlan_overlap.setValue(float(config.muqlan_window_overlap_sec))
+        mulan_form.addRow("Window overlap (s):", self._muqlan_overlap)
+        self._muqlan_batch = QSpinBox()
+        self._muqlan_batch.setRange(1, 64)
+        self._muqlan_batch.setValue(int(config.muqlan_batch_size))
+        mulan_form.addRow("Batch size:", self._muqlan_batch)
+        self._muqlan_top_k = QSpinBox()
+        self._muqlan_top_k.setRange(1, 20)
+        self._muqlan_top_k.setValue(int(config.muqlan_tag_top_k))
+        mulan_form.addRow("Tag top K:", self._muqlan_top_k)
+        tags_layout = QVBoxLayout()
+        tags_layout.setContentsMargins(0, 0, 0, 0)
+        from app.models.muq_model import candidate_tags
+        self._muqlan_default_tags = tuple(candidate_tags())
+        self._muqlan_tags_edit = QPlainTextEdit()
+        self._muqlan_tags_edit.setPlainText(
+            "\n".join(getattr(config, "muqlan_tags", None)
+                      or candidate_tags()))
+        self._muqlan_tags_edit.setToolTip(
+            "One candidate tag per line — MuQ-MuLan scores every chunk "
+            "against this list (tags are wrapped as \"<tag> music.\" "
+            "prompts; the text side understands English and Chinese).")
+        self._muqlan_tags_edit.setMaximumHeight(150)
+        tags_layout.addWidget(self._muqlan_tags_edit)
+        tag_buttons = QHBoxLayout()
+        self._muqlan_tags_reset = QPushButton("Restore default list")
+        self._muqlan_tags_reset.clicked.connect(self._on_reset_muqlan_tags)
+        tag_buttons.addWidget(self._muqlan_tags_reset)
+        tag_buttons.addStretch(1)
+        tags_layout.addLayout(tag_buttons)
+        mulan_form.addRow("Candidate tags:", tags_layout)
+        layout.addWidget(mulan_box)
+        layout.addStretch(1)
+        return page
+
+    def _build_lpmc_page(self, config: AppConfig) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        box = QGroupBox("LP-MusicCaps (captions + 768-d mel-CNN embeddings)")
+        form = QFormLayout(box)
+        self._lpmc_model_combo = QComboBox()
+        self._lpmc_model_combo.setEditable(True)
+        self._lpmc_model_combo.addItem(LPMC_MODEL_ID)
+        if config.lpmc_model_id != LPMC_MODEL_ID:
+            self._lpmc_model_combo.addItem(config.lpmc_model_id)
+        self._lpmc_model_combo.setCurrentText(config.lpmc_model_id)
+        self._lpmc_model_combo.setToolTip(
+            "LP-MusicCaps (ISMIR 2023) — Whisper-style mel front-end + "
+            "strided convs feeding facebook/bart-base.  Produces beam-5 "
+            "captions per 10 s window (stored as chunk tags) and a 768-d "
+            "mel-CNN embedding.  The transfer.pth checkpoint (~1.8 GB) "
+            "downloads from Hugging Face on first use.")
+        form.addRow("Model id:", self._lpmc_model_combo)
+        self._lpmc_ckpt_combo = QComboBox()
+        self._lpmc_ckpt_combo.setEditable(True)
+        for variant in (LPMC_CHECKPOINT_FILE, "supervised.pth",
+                        "pretrain.pth"):
+            self._lpmc_ckpt_combo.addItem(variant)
+        self._lpmc_ckpt_combo.setCurrentText(config.lpmc_checkpoint_file)
+        self._lpmc_ckpt_combo.setToolTip(
+            "Which official checkpoint to caption with: transfer.pth "
+            "(default — best quality captions), supervised.pth, or "
+            "pretrain.pth.")
+        form.addRow("Checkpoint file:", self._lpmc_ckpt_combo)
+        self._lpmc_batch = QSpinBox()
+        self._lpmc_batch.setRange(1, 64)
+        self._lpmc_batch.setValue(int(config.lpmc_batch_size))
+        form.addRow("Batch size:", self._lpmc_batch)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page
+
+    def _build_qwen2audio_page(self, config: AppConfig) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        box = QGroupBox("Qwen2-Audio (Whisper-tower embeddings, 16 kHz)")
+        form = QFormLayout(box)
+        self._qwen2audio_model_combo = QComboBox()
+        self._qwen2audio_model_combo.setEditable(True)
+        self._qwen2audio_model_combo.addItem(QWEN2AUDIO_MODEL_ID)
+        if config.qwen2audio_model_id != QWEN2AUDIO_MODEL_ID:
+            self._qwen2audio_model_combo.addItem(config.qwen2audio_model_id)
+        self._qwen2audio_model_combo.setCurrentText(
+            config.qwen2audio_model_id)
+        self._qwen2audio_model_combo.setToolTip(
+            "Qwen/Qwen2-Audio-7B-Instruct (Apache-2.0) — the audio tower "
+            "is a Whisper-large-v3-style encoder (1280-d).  Only the "
+            "tower is loaded for analysis; the 16.8 GB bf16 checkpoint "
+            "downloads from Hugging Face on first use (needs ~17 GB "
+            "free disk and, for CPU/MPS inference, a 32 GB+ machine is "
+            "comfortable).")
+        form.addRow("Model id:", self._qwen2audio_model_combo)
+        self._qwen2audio_batch = QSpinBox()
+        self._qwen2audio_batch.setRange(1, 16)
+        self._qwen2audio_batch.setValue(int(config.qwen2audio_batch_size))
+        form.addRow("Batch size:", self._qwen2audio_batch)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page
+
     def _build_fft_page(self, config: AppConfig) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -376,6 +592,52 @@ class SettingsDialog(QDialog):
         self._config.mert330_window_sec = window_sec
         self._config.mert330_window_overlap_sec = overlap_sec
         self._config.mert330_batch_size = int(self._mert330_batch.value())
+        # M2D-CLAP (tag semantics identical to CLAP: None = built-in list)
+        self._config.m2dclap_tag_top_k = int(self._m2dclap_top_k.value())
+        self._config.m2dclap_batch_size = int(self._m2dclap_batch.value())
+        self._config.m2dclap_tags = self._parse_m2dclap_tags()
+        if (not self._config.m2dclap_tags
+                or self._config.m2dclap_tags
+                == list(self._m2dclap_default_tags)):
+            self._config.m2dclap_tags = None
+        # MuQ (overlap clamped to stay below the window length)
+        self._config.muq_model_id = self._muq_model_combo.currentText().strip() \
+            or AppConfig().muq_model_id
+        window_sec = float(self._muq_window.value())
+        overlap_sec = float(self._muq_overlap.value())
+        overlap_sec = max(0.0, min(window_sec - 0.5, overlap_sec))
+        self._config.muq_window_sec = window_sec
+        self._config.muq_window_overlap_sec = overlap_sec
+        self._config.muq_batch_size = int(self._muq_batch.value())
+        # MuQ-MuLan (same clamping + tag semantics)
+        self._config.muqlan_model_id = \
+            self._muqlan_model_combo.currentText().strip() \
+            or AppConfig().muqlan_model_id
+        window_sec = float(self._muqlan_window.value())
+        overlap_sec = float(self._muqlan_overlap.value())
+        overlap_sec = max(0.0, min(window_sec - 0.5, overlap_sec))
+        self._config.muqlan_window_sec = window_sec
+        self._config.muqlan_window_overlap_sec = overlap_sec
+        self._config.muqlan_batch_size = int(self._muqlan_batch.value())
+        self._config.muqlan_tag_top_k = int(self._muqlan_top_k.value())
+        self._config.muqlan_tags = self._parse_muqlan_tags()
+        if (not self._config.muqlan_tags
+                or self._config.muqlan_tags
+                == list(self._muqlan_default_tags)):
+            self._config.muqlan_tags = None
+        # LP-MusicCaps
+        self._config.lpmc_model_id = \
+            self._lpmc_model_combo.currentText().strip() \
+            or AppConfig().lpmc_model_id
+        self._config.lpmc_checkpoint_file = \
+            self._lpmc_ckpt_combo.currentText().strip() \
+            or LPMC_CHECKPOINT_FILE
+        self._config.lpmc_batch_size = int(self._lpmc_batch.value())
+        # Qwen2-Audio
+        self._config.qwen2audio_model_id = \
+            self._qwen2audio_model_combo.currentText().strip() \
+            or AppConfig().qwen2audio_model_id
+        self._config.qwen2audio_batch_size = int(self._qwen2audio_batch.value())
         # FFT
         self._config.fft_window_sec = float(self._fft_window.value())
         self._config.use_ollama = self._use_ollama.isChecked()
@@ -390,6 +652,33 @@ class SettingsDialog(QDialog):
         seen: set[str] = set()
         tags: list[str] = []
         for raw in self._clap_tags_edit.toPlainText().splitlines():
+            tag = raw.strip()
+            if tag and tag.casefold() not in seen:
+                seen.add(tag.casefold())
+                tags.append(tag)
+        return tags
+
+    def _parse_m2dclap_tags(self) -> list[str]:
+        return self._parse_tag_lines(self._m2dclap_tags_edit)
+
+    def _on_reset_m2dclap_tags(self) -> None:
+        self._m2dclap_tags_edit.setPlainText(
+            "\n".join(self._m2dclap_default_tags))
+
+    def _parse_muqlan_tags(self) -> list[str]:
+        return self._parse_tag_lines(self._muqlan_tags_edit)
+
+    def _on_reset_muqlan_tags(self) -> None:
+        self._muqlan_tags_edit.setPlainText(
+            "\n".join(self._muqlan_default_tags))
+
+    @staticmethod
+    def _parse_tag_lines(edit) -> list[str]:
+        """One tag per line, trimmed; blanks dropped; duplicates collapse
+        (first occurrence wins, order preserved)."""
+        seen: set[str] = set()
+        tags: list[str] = []
+        for raw in edit.toPlainText().splitlines():
             tag = raw.strip()
             if tag and tag.casefold() not in seen:
                 seen.add(tag.casefold())

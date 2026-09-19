@@ -24,10 +24,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Iterable
 
+import logging
+
 import numpy as np
 
 from app.db import repo
 from app.db.database import Database
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "METHODS",
@@ -43,25 +47,48 @@ __all__ = [
 #: Noise detectors offered to the user.
 METHODS = ("hdbscan", "optics")
 
-#: Point caps — one-time runs over many small per-track fits; refuse the
-#: truly absurd instead of running for hours.
-HDBSCAN_MAX_POINTS = 200_000
-OPTICS_MAX_POINTS = 100_000
+#: Point caps — one-time runs over many small per-track fits (cost scales
+#: ~linearly, a 141k-chunk library fits in ~1-2 min per method); refuse
+#: the truly absurd instead of running for hours.
+HDBSCAN_MAX_POINTS = 1_000_000
+OPTICS_MAX_POINTS = 1_000_000
+
+#: A model needs at least this many chunk vectors before the post-run
+#: clustering bothers with it (HDBSCAN/OPTICS find nothing meaningful in
+#: a handful of points).
+MIN_NOISE_VECTORS = 20
 
 #: Neighborhood size for the per-track density scores (clamped to the
 #: track's chunk count).
 DENSITY_NEIGHBORS = 4
 
-#: A chunk is noise when its density score exceeds this multiple of its
-#: song's median score.  Real music chunks sit within ~2x of each other;
-#: junk (silence, dropouts, spectral flukes) lands an order of magnitude
-#: away, so 4x separates them cleanly while flagging ~0.1 % of clean
-#: libraries.
-NOISE_REACH_FACTOR = 4.0
+#: A chunk is only noise when the density algorithm leaves it unclustered
+#: AND its local reachability is an outlier vs its own song's median
+#: (k-NN distance above this multiple).  The cross-check kills the false
+#: positives HDBSCAN/OPTICS produce inside degenerate near-uniform songs
+#: (sklearn's HDBSCAN happily marks arbitrary points of a perfectly tight
+#: blob as -1); real junk (silence, fades, dropouts) fails BOTH tests.
+NOISE_REACH_FACTOR = 2.0
 
 #: Tracks with fewer chunks than this are never clustered (a 3-chunk
 #: song has no meaningful density structure to violate).
 MIN_TRACK_CHUNKS = 6
+
+
+def _reachability_outliers(x: np.ndarray) -> np.ndarray:
+    """``True`` where the k-NN distance exceeds ``NOISE_REACH_FACTOR`` x
+    the song's median k-NN distance (junk lands an order of magnitude
+    away; texture chunks sit within ~2x of each other)."""
+    from sklearn.neighbors import NearestNeighbors
+
+    n = len(x)
+    k = max(1, min(DENSITY_NEIGHBORS, n - 1))
+    dist, _idx = NearestNeighbors(n_neighbors=k + 1).fit(x).kneighbors(x)
+    reach = dist[:, 1:].mean(axis=1)
+    median = float(np.median(reach))
+    if median <= 0.0:
+        return np.zeros(n, dtype=bool)
+    return reach > median * NOISE_REACH_FACTOR
 
 
 def availability() -> dict[str, str | None]:
@@ -81,11 +108,13 @@ def availability() -> dict[str, str | None]:
 
 
 def _dataset_vectors_by_track(conn, dataset: str,
+                              track_ids=None
                               ) -> dict[int, list[tuple[int, np.ndarray]]]:
     """All chunk vectors of *dataset*, grouped per song.
 
-    Returns ``{track_id: [(chunk_id, vector), ...]}`` with tracks and
-    chunks in stable (id / timeline) order.
+    With *track_ids* only those songs are returned (the incremental
+    post-analysis refit).  Returns ``{track_id: [(chunk_id, vector), ...]}``
+    with tracks and chunks in stable (id / timeline) order.
     """
     grouped: dict[int, list[tuple[int, np.ndarray]]] = {}
     if dataset.startswith("red:"):
@@ -104,6 +133,10 @@ def _dataset_vectors_by_track(conn, dataset: str,
         for row in rows:
             grouped.setdefault(int(row["track_id"]), []).append(
                 (int(row["chunk_id"]), repo.blob_to_vec(row["vector"])))
+    if track_ids is not None:
+        wanted = {int(t) for t in track_ids}
+        grouped = {t: chunks for t, chunks in grouped.items()
+                   if t in wanted}
     if not grouped:
         raise RuntimeError(
             f"Dataset '{dataset}' has no chunk vectors yet — analyze "
@@ -118,54 +151,70 @@ def _l2(matrix: np.ndarray) -> np.ndarray:
                      where=norms > 0)
 
 
-def _hdbscan_density_scores(x: np.ndarray) -> np.ndarray:
-    """HDBSCAN's mutual-reachability density, one score per chunk.
+def _track_noise_labels(x: np.ndarray, method: str) -> np.ndarray:
+    """Density-cluster one song's chunk matrix; ``True`` marks outliers.
 
-    The score is the mean mutual reachability
-    ``max(core_i, core_j, dist(i, j))`` from each chunk to its
-    ``DENSITY_NEIGHBORS`` nearest same-song chunks — the exact quantity
-    the HDBSCAN hierarchy is built on.  Junk chunks are far from
-    everything, so their score spikes.
+    The REAL algorithms from scikit-learn, run per song:
+
+    * ``hdbscan`` — :class:`sklearn.cluster.HDBSCAN` finds the song's
+      dense texture cluster(s); points not belonging to any cluster
+      (``label == -1``) are the outlier candidates — silence, fades,
+      dropouts, spectral flukes.
+    * ``optics`` — :class:`sklearn.cluster.OPTICS` ordering, extracted
+      DBSCAN-style at a per-song epsilon (2x the median k-NN distance —
+      OPTICS' own reachability machinery drives the extraction).
+
+    A candidate only becomes noise when its local reachability is ALSO
+    an outlier vs the song's median (see
+    :func:`_reachability_outliers`) — the two-factor rule keeps the
+    algorithms' degenerate false positives (arbitrary -1s inside a
+    perfectly tight blob) out of the results while real junk fails both
+    tests by an order of magnitude.
     """
+    n = len(x)
+    if method == "hdbscan":
+        from sklearn.cluster import HDBSCAN
+
+        labels = np.asarray(HDBSCAN(
+            min_cluster_size=max(3, min(5, n - 2)), min_samples=1,
+            metric="euclidean").fit(x).labels_)
+    elif method == "optics":
+        from sklearn.cluster import OPTICS, cluster_optics_dbscan
+
+        k = max(1, min(DENSITY_NEIGHBORS, n - 1))
+        dist, _idx = _knn_distances(x, k)
+        eps = float(np.median(dist[:, 1:].mean(axis=1))) * 2.0
+        model = OPTICS(min_samples=max(2, min(3, n - 2)),
+                       metric="euclidean").fit(x)
+        labels = np.asarray(cluster_optics_dbscan(
+            reachability=model.reachability_,
+            core_distances=model.core_distances_,
+            ordering=model.ordering_, eps=eps))
+    else:
+        raise ValueError(f"unknown noise-filter method: {method!r}")
+    return (labels == -1) & _reachability_outliers(x)
+
+
+def _knn_distances(x: np.ndarray, k: int):
+    """Distances to the k nearest neighbors (column 0 = self, dropped by
+    callers via ``[:, 1:]``)."""
     from sklearn.neighbors import NearestNeighbors
 
-    n = len(x)
-    k = min(DENSITY_NEIGHBORS + 1, n - 1)
-    nn = NearestNeighbors(n_neighbors=k).fit(x)
-    dist, _idx = nn.kneighbors(x)
-    core = dist[:, -1]
-    mutual = np.maximum(dist[:, 1:], core[:, None])
-    return mutual.mean(axis=1)
-
-
-def _optics_density_scores(x: np.ndarray) -> np.ndarray:
-    """OPTICS' ordering reachability, one score per chunk.
-
-    ``reachability_[i]`` is the distance from chunk *i* to its
-    predecessor in the OPTICS ordering — the algorithm's own density
-    measure.  The first chunk has no predecessor (NaN → never flagged).
-    """
-    from sklearn.cluster import OPTICS
-
-    optics = OPTICS(min_samples=min(DENSITY_NEIGHBORS, len(x) - 1),
-                    n_jobs=1).fit(x)
-    reach = optics.reachability_.astype(np.float64).copy()
-    reach[0] = np.nan
-    return reach
+    return NearestNeighbors(n_neighbors=k + 1).fit(x).kneighbors(x)
 
 
 def fit_noise_filter(db_path: Path | str, dataset: str, method: str, *,
                      progress_cb: Callable[[str, float], None] | None = None,
                      ) -> dict:
-    """Flag noise chunks WITHIN each song and store them.
+    """Cluster every song's chunks with the requested density algorithm
+    and store the outlier (noise) chunks.
 
     Every track's chunks are clustered separately — a chunk is judged
     against its own song, never against the whole library.  Chunks are
-    L2-normalized (the app's cosine space) and scored with the requested
-    density method (HDBSCAN mutual reachability or OPTICS ordering
-    reachability); a chunk is noise when its score exceeds
-    ``NOISE_REACH_FACTOR`` x its song's median score.  Tracks with fewer
-    than ``MIN_TRACK_CHUNKS`` chunks are skipped (no flags).
+    L2-normalized (the app's cosine space) and clustered with the REAL
+    scikit-learn algorithm (HDBSCAN or OPTICS); chunks the algorithm
+    leaves unclustered (``label == -1``) are stored as noise.  Tracks
+    with fewer than ``MIN_TRACK_CHUNKS`` chunks are skipped (no flags).
 
     ``progress_cb`` receives ``(message, fraction)`` with fraction in
     ``[0, 1]``.  Returns ``{"filter_id", "dataset", "method",
@@ -198,8 +247,6 @@ def fit_noise_filter(db_path: Path | str, dataset: str, method: str, *,
             f"{method.upper()} is limited to {cap:,} chunk vectors per "
             f"run — '{dataset}' has {n_total:,}.")
 
-    scorer = (_hdbscan_density_scores if method == "hdbscan"
-              else _optics_density_scores)
     tracks = [chunks for chunks in by_track.values()
               if len(chunks) >= MIN_TRACK_CHUNKS]
     total_tracks = len(tracks)
@@ -212,33 +259,199 @@ def fit_noise_filter(db_path: Path | str, dataset: str, method: str, *,
         ids = [chunk_id for chunk_id, _vec in chunks]
         matrix = _l2(np.stack([np.asarray(vec, dtype=np.float64)
                                for _cid, vec in chunks]))
-        scores = scorer(matrix)
-        finite = scores[np.isfinite(scores)]
-        if finite.size:
-            median = float(np.median(finite))
-            if median > 0.0:
-                flags = np.where(np.isfinite(scores),
-                                 scores > median * NOISE_REACH_FACTOR,
-                                 False)
-                noise_ids.extend(chunk_id for chunk_id, flagged
-                                 in zip(ids, flags) if flagged)
+        flags = _track_noise_labels(matrix, method)
+        noise_ids.extend(chunk_id for chunk_id, flagged
+                         in zip(ids, flags) if flagged)
         if position % 25 == 0 or position == total_tracks:
             announce(f"Clustering song {position:,}/{total_tracks:,} "
                      f"with {method.upper()}…",
                      0.02 + 0.95 * position / total_tracks)
 
-    params = ('{"scope": "per-track", "min_samples": %d, '
-              '"reach_factor": %g, "min_track_chunks": %d}'
-              % (DENSITY_NEIGHBORS, NOISE_REACH_FACTOR, MIN_TRACK_CHUNKS))
+    params = ('{"scope": "per-track", "algorithm": "%s", '
+              '"min_track_chunks": %d}'
+              % (method, MIN_TRACK_CHUNKS))
     announce("Storing noise flags…", 0.98)
+    signatures = {track_id: (len(chunks), sum(chunk_id for chunk_id, _ in
+                                              chunks))
+                  for track_id, chunks in by_track.items()
+                  if len(chunks) >= MIN_TRACK_CHUNKS}
     with db.transaction() as conn:
         filter_id = repo.set_noise_filter_result(
             conn, dataset, method, params, n_total, len(noise_ids),
             noise_ids)
+        # everything clustered here — the incremental bookkeeping catches up
+        repo.record_noise_run_tracks(conn, dataset, method, signatures)
     announce(f"Done — {len(noise_ids):,} of {n_total:,} chunks flagged.",
              1.0)
     return {"filter_id": filter_id, "dataset": dataset, "method": method,
             "n_vectors": n_total, "n_noise": len(noise_ids)}
+
+
+def fit_noise_filter_tracks(db_path: Path | str, dataset: str, method: str,
+                            track_ids, *,
+                            progress_cb: Callable[[str, float], None]
+                            | None = None) -> dict:
+    """Re-cluster ONLY the given songs and merge into the stored filter.
+
+    The incremental post-analysis path: a song's noise flags depend only
+    on that song's own chunks, so an analysis run that (re-)embedded
+    tracks *T* under model *M* only has to recompute the *T* rows of the
+    ``(M, method)`` filter — every other song's flags stay untouched and
+    the update costs milliseconds per song instead of a full-library
+    pass.
+
+    Replaces the previous flags of the given tracks with the fresh ones
+    (a re-analyzed song's new chunks cannot keep old flags), creates the
+    filter row when none exists yet, and refreshes the stored vector
+    count.  Raises the same friendly ``RuntimeError`` messages as
+    :func:`fit_noise_filter` (unknown method, missing dependency, dataset
+    under ``MIN_NOISE_VECTORS`` vectors).
+    """
+    if method not in METHODS:
+        raise ValueError(f"unknown noise-filter method: {method!r}")
+    missing = availability().get(method)
+    if missing:
+        raise RuntimeError(missing)
+    wanted_tracks = sorted({int(t) for t in track_ids})
+    if not wanted_tracks:
+        return {"filter_id": None, "dataset": dataset, "method": method,
+                "n_vectors": 0, "n_noise": 0, "n_refit_tracks": 0}
+
+    def announce(message: str, fraction: float = 0.0) -> None:
+        if progress_cb is not None:
+            progress_cb(message, fraction)
+
+    db = Database(db_path)
+    with db.transaction() as conn:
+        try:
+            if dataset.startswith("red:"):
+                n_total = len(repo.get_reduced_chunk_embeddings(
+                    conn, int(dataset[4:])))
+            else:
+                n_total = int(conn.execute(
+                    "SELECT COUNT(*) FROM embeddings WHERE model = ?",
+                    (dataset,)).fetchone()[0])
+        except Exception as exc:
+            raise RuntimeError(f"Cannot count '{dataset}' vectors: {exc}")
+    if n_total < MIN_NOISE_VECTORS:
+        raise RuntimeError(
+            f"'{dataset}' has only {n_total} chunk vectors — noise "
+            "filtering needs at least "
+            f"{MIN_NOISE_VECTORS} chunk vectors to be meaningful.")
+    cap = HDBSCAN_MAX_POINTS if method == "hdbscan" else OPTICS_MAX_POINTS
+    if n_total > cap:
+        raise RuntimeError(
+            f"{method.upper()} is limited to {cap:,} chunk vectors per "
+            f"run — '{dataset}' has {n_total:,}.")
+
+    announce(f"Re-clustering {len(wanted_tracks)} song(s) with "
+             f"{method.upper()}…", 0.1)
+    with db.transaction() as conn:
+        by_track = _dataset_vectors_by_track(conn, dataset, wanted_tracks)
+    fresh_flags: set[int] = set()
+    refit_tracks = 0
+    for chunks in by_track.values():
+        if len(chunks) < MIN_TRACK_CHUNKS:
+            continue          # too few chunks to judge a song's density
+        ids = [chunk_id for chunk_id, _vec in chunks]
+        matrix = _l2(np.stack([np.asarray(vec, dtype=np.float64)
+                               for _cid, vec in chunks]))
+        flags = _track_noise_labels(matrix, method)
+        fresh_flags.update(chunk_id for chunk_id, flagged
+                           in zip(ids, flags) if flagged)
+        refit_tracks += 1
+
+    params = ('{"scope": "per-track", "algorithm": "%s", '
+              '"min_track_chunks": %d}'
+              % (method, MIN_TRACK_CHUNKS))
+    signatures = {track_id: (len(chunks), sum(chunk_id for chunk_id, _ in
+                                              chunks))
+                  for track_id, chunks in by_track.items()
+                  if len(chunks) >= MIN_TRACK_CHUNKS}
+    with db.transaction() as conn:
+        row = repo.get_noise_filter(conn, dataset, method)
+        if row is None:
+            filter_id = repo.set_noise_filter_result(
+                conn, dataset, method, params, n_total, len(fresh_flags),
+                sorted(fresh_flags))
+        else:
+            # old flags of the re-clustered tracks are dropped: their
+            # chunks either changed or were re-judged just now
+            with_raw = conn.execute(
+                "SELECT nc.chunk_id AS chunk_id FROM noise_chunks nc "
+                "JOIN chunks c ON c.id = nc.chunk_id "
+                "WHERE nc.filter_id = ? AND c.track_id IN "
+                f"({', '.join('?' * len(wanted_tracks))})",
+                [int(row["id"]), *wanted_tracks]).fetchall()
+            stale = {int(r["chunk_id"]) for r in with_raw}
+            kept = {int(r["chunk_id"]) for r in conn.execute(
+                "SELECT chunk_id FROM noise_chunks WHERE filter_id = ?",
+                (int(row["id"]),)).fetchall()} - stale
+            merged = kept | fresh_flags
+            repo.update_noise_filter_result(conn, int(row["id"]), params,
+                                            n_total, sorted(merged))
+            filter_id = int(row["id"])
+        repo.record_noise_run_tracks(conn, dataset, method, signatures)
+    announce(f"Done — {len(fresh_flags):,} of the re-clustered chunks "
+             "flagged.", 1.0)
+    return {"filter_id": filter_id, "dataset": dataset, "method": method,
+            "n_vectors": n_total, "n_noise": len(fresh_flags),
+            "n_refit_tracks": refit_tracks}
+
+
+def fit_noise_filter_pending(db_path: Path | str, datasets, methods=METHODS,
+                             *, progress_cb: Callable[[str, float], None]
+                             | None = None) -> list[dict]:
+    """Cluster ONLY the tracks not yet clustered for (dataset, method).
+
+    The button-driven noise pass: after every analysis run nothing runs
+    automatically; when the user asks for outliers, each covered dataset's
+    PENDING songs — newly analyzed tracks, and re-analyzed tracks whose
+    chunk ids changed (see ``repo.pending_noise_tracks``) — are re-judged
+    incrementally and merged into the stored filters.  Datasets below
+    ``MIN_NOISE_VECTORS`` vectors (or over their cap) are skipped
+    silently.  Returns one summary dict per actually-fitted
+    (dataset, method).
+    """
+    def announce(message: str, fraction: float = 0.0) -> None:
+        if progress_cb is not None:
+            progress_cb(message, fraction)
+
+    results: list[dict] = []
+    dataset_list = sorted({str(d) for d in datasets})
+    for d_position, dataset in enumerate(dataset_list):
+        db = Database(db_path)
+        try:
+            with db.transaction() as conn:
+                if dataset.startswith("red:"):
+                    n_total = len(repo.get_reduced_chunk_embeddings(
+                        conn, int(dataset[4:])))
+                else:
+                    n_total = int(conn.execute(
+                        "SELECT COUNT(*) FROM embeddings WHERE model = ?",
+                        (dataset,)).fetchone()[0])
+                pending = {method: repo.pending_noise_tracks(
+                               conn, dataset, method, MIN_TRACK_CHUNKS)
+                           for method in methods}
+        except Exception as exc:
+            log.warning("Noise sweep pre-check for %s skipped: %s",
+                        dataset, exc)
+            continue
+        if n_total < MIN_NOISE_VECTORS:
+            continue
+        for m_position, method in enumerate(methods):
+            track_ids = pending.get(method, [])
+            if not track_ids:
+                continue
+            announce(f"{dataset} / {method.upper()}: {len(track_ids):,} "
+                     "new song(s)…",
+                     (d_position + m_position / max(1, len(methods)))
+                     / max(1, len(dataset_list)))
+            result = fit_noise_filter_tracks(db_path, dataset, method,
+                                             track_ids,
+                                             progress_cb=progress_cb)
+            results.append(result)
+    return results
 
 
 def filters_for_dataset(conn, dataset: str) -> dict[str, dict]:

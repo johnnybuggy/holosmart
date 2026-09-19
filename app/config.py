@@ -34,7 +34,9 @@ class AppConfig:
     chunk_seconds: float = 20.0
     overlap_percent: float = 50.0
     # Model plugin names to run during analysis; unknown names are ignored with a warning.
-    models: list[str] = field(default_factory=lambda: ["clap", "mert", "openl3", "fft"])
+    models: list[str] = field(default_factory=lambda: [
+        "clap", "mert", "openl3", "fft", "m2dclap", "muq", "muqlan",
+        "lpmc", "qwen2audio"])
     # Ollama integration (similarity via text embeddings of track descriptions).
     use_ollama: bool = True
     ollama_host: str = "http://127.0.0.1:11434"
@@ -64,6 +66,35 @@ class AppConfig:
     mert330_batch_size: int = 4
     # FFT plugin settings (defaults = the module constants in app.models.fft_model).
     fft_window_sec: float = 10.0
+    # M2D-CLAP plugin settings (NTT audio-language model; weights are a
+    # ~1.5 GB GitHub release fetched once into <data>/models/m2d — non-
+    # commercial NTT evaluation license, so it is opt-out-able like any
+    # model in Settings → Analysis models).
+    m2dclap_tag_top_k: int = 5
+    m2dclap_batch_size: int = 4
+    m2dclap_tags: list[str] | None = None
+    # MuQ plugin settings (Tencent SSL music encoder, 24 kHz, 1024-d).
+    muq_model_id: str = "OpenMuQ/MuQ-large-msd-iter"
+    muq_window_sec: float = 10.0
+    muq_window_overlap_sec: float = 1.0
+    muq_batch_size: int = 4
+    # MuQ-MuLan plugin settings (joint music-text embeddings, 512-d, plus
+    # zero-shot tags over English/Chinese captions).
+    muqlan_model_id: str = "OpenMuQ/MuQ-MuLan-large"
+    muqlan_window_sec: float = 10.0
+    muqlan_window_overlap_sec: float = 1.0
+    muqlan_batch_size: int = 4
+    muqlan_tag_top_k: int = 5
+    muqlan_tags: list[str] | None = None
+    # LP-MusicCaps plugin settings (captioning; 16 kHz, 768-d mel-CNN
+    # embeddings, beam-5 captions stored as chunk tags).
+    lpmc_model_id: str = "seungheondoh/lp-music-caps"
+    lpmc_checkpoint_file: str = "transfer.pth"
+    lpmc_batch_size: int = 4
+    # Qwen2-Audio plugin settings (Whisper-tower embeddings, 16 kHz,
+    # 1280-d; the checkpoint is ~16.8 GB bf16, fetched once on demand).
+    qwen2audio_model_id: str = "Qwen/Qwen2-Audio-7B-Instruct"
+    qwen2audio_batch_size: int = 2
     # How many tracks the analysis worker processes concurrently (1 = the old
     # sequential behavior). Values < 1 are clamped to 1 where the worker uses
     # the value, never at load time.
@@ -87,7 +118,9 @@ class AppConfig:
     # config file saved without this field (i.e. written by an older build)
     # gets the new models appended exactly once; afterwards the user's own
     # on/off choice is respected because save() persists the version.
-    models_version: int = 2
+    # v3: M2D-CLAP + MuQ + MuQ-MuLan.
+    # v4: LP-MusicCaps + Qwen2-Audio.
+    models_version: int = 4
 
     @staticmethod
     def load() -> "AppConfig":
@@ -99,12 +132,26 @@ class AppConfig:
                 for key, value in raw.items():
                     if key in known:
                         setattr(cfg, key, value)
-                # One-time migration for configs written before the FFT plugin
-                # existed (no models_version field): enable "fft" once. After
-                # the first save the version field is present, so a deliberately
-                # disabled FFT stays disabled.
-                if "models_version" not in raw and "fft" not in cfg.models:
+                # One-time migrations, guarded by models_version so each
+                # runs exactly once per installation:
+                # v0 → v2: enable "fft" once (configs written before the FFT
+                # plugin existed have no models_version field).
+                # v2 → v3: enable M2D-CLAP + MuQ + MuQ-MuLan once.
+                version = raw.get("models_version", 0)
+                if version < 2 and "fft" not in cfg.models:
                     cfg.models.append("fft")
+                if version < 3:
+                    for name in ("m2dclap", "muq", "muqlan"):
+                        if name not in cfg.models:
+                            cfg.models.append(name)
+                if version < 4:
+                    for name in ("lpmc", "qwen2audio"):
+                        if name not in cfg.models:
+                            cfg.models.append(name)
+                # Migrations applied: the in-memory version must reflect the
+                # current shape, or a save() would persist the OLD version
+                # and the same append would clobber a later opt-out.
+                cfg.models_version = AppConfig.models_version
         except Exception:  # corrupted config must never prevent startup
             pass
         return cfg
