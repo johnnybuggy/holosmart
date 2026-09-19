@@ -6,8 +6,12 @@ import threading
 from app.models.base import ModelPlugin
 from app.models.clap_model import ClapPlugin
 from app.models.fft_model import FftPlugin
+from app.models.m2dclap_model import M2dClapPlugin
+from app.models.lpmusiccaps_model import LpMusicCapsPlugin
 from app.models.mert_model import Mert330Plugin, MertPlugin
+from app.models.muq_model import MuQMuLanPlugin, MuQPlugin
 from app.models.openl3_model import OpenL3Plugin
+from app.models.qwen2audio_model import Qwen2AudioPlugin
 
 _lock = threading.Lock()
 _instances: dict[str, ModelPlugin] = {}
@@ -15,7 +19,9 @@ _instances: dict[str, ModelPlugin] = {}
 
 def _plugin_classes() -> list[type[ModelPlugin]]:
     """All registered plugin classes, in canonical order."""
-    return [ClapPlugin, MertPlugin, Mert330Plugin, OpenL3Plugin, FftPlugin]
+    return [ClapPlugin, MertPlugin, Mert330Plugin, M2dClapPlugin,
+            MuQPlugin, MuQMuLanPlugin, LpMusicCapsPlugin, Qwen2AudioPlugin,
+            OpenL3Plugin, FftPlugin]
 
 
 def get_plugin(name: str) -> ModelPlugin:
@@ -36,7 +42,7 @@ def get_plugin(name: str) -> ModelPlugin:
 
 def list_plugins() -> list[ModelPlugin]:
     """All plugin singletons in canonical order (clap, mert, mert330,
-    openl3, fft)."""
+    m2dclap, muq, muqlan, lpmc, qwen2audio, openl3, fft)."""
     with _lock:
         if not _instances:
             for cls in _plugin_classes():

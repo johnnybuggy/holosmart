@@ -160,6 +160,19 @@ CREATE TABLE IF NOT EXISTS noise_chunks (
 CREATE INDEX IF NOT EXISTS idx_noise_chunks_chunk
     ON noise_chunks(chunk_id);
 
+-- Which tracks a (dataset, method) noise run has already clustered, with a
+-- cheap signature of the clustered chunk set (count + id sum).  Clustering
+-- is button-driven and incremental: a track is re-clustered only when it is
+-- missing here or its signature changed (re-analysis replaced its chunks).
+CREATE TABLE IF NOT EXISTS noise_run_tracks (
+    dataset        TEXT NOT NULL,
+    method         TEXT NOT NULL,
+    track_id       INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    n_chunks       INTEGER NOT NULL,
+    chunk_sum      INTEGER NOT NULL,
+    PRIMARY KEY (dataset, method, track_id)
+);
+
 -- Learning: user-supplied song pairs + learned per-component weights.
 -- A pair says "these two tracks sound similar to me"; the weight optimizer
 -- searches for the vector components (per model, primarily FFT) whose

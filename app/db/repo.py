@@ -45,6 +45,10 @@ __all__ = [
     "get_chunk_vector_models",
     "chunk_vector_counts",
     "set_noise_filter_result",
+    "update_noise_filter_result",
+    "noise_track_signatures",
+    "record_noise_run_tracks",
+    "pending_noise_tracks",
     "get_noise_filter",
     "list_noise_filters",
     "get_noise_chunk_ids",
@@ -858,6 +862,53 @@ def set_noise_filter_result(conn: sqlite3.Connection, dataset: str,
     return filter_id
 
 
+def noise_track_signatures(conn: sqlite3.Connection, dataset: str,
+                           ) -> dict[int, tuple[int, int]]:
+    """``{track_id: (n_chunks, sum(chunk_id))}`` for one vector dataset.
+
+    The cheap per-song signature the noise bookkeeping compares against:
+    re-analysis changes a track's chunk ids, which changes both numbers.
+    """
+    rows = conn.execute(
+        "SELECT c.track_id AS track_id, COUNT(*) AS n, SUM(c.id) AS s "
+        "FROM chunks c JOIN embeddings e ON e.chunk_id = c.id "
+        "WHERE e.model = ? GROUP BY c.track_id", (str(dataset),)).fetchall()
+    return {int(r["track_id"]): (int(r["n"]), int(r["s"])) for r in rows}
+
+
+def record_noise_run_tracks(conn: sqlite3.Connection, dataset: str,
+                            method: str, signatures: dict[int,
+                                                          tuple[int, int]]
+                            ) -> None:
+    """Store which tracks a (dataset, method) run has clustered."""
+    conn.executemany(
+        "INSERT OR REPLACE INTO noise_run_tracks"
+        "(dataset, method, track_id, n_chunks, chunk_sum) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(str(dataset), str(method), int(track_id), int(n), int(s))
+         for track_id, (n, s) in signatures.items()])
+
+
+def pending_noise_tracks(conn: sqlite3.Connection, dataset: str,
+                         method: str, min_track_chunks: int) -> list[int]:
+    """Track ids of *dataset* not yet clustered for *method*.
+
+    Pending = no bookkeeping row, or the stored signature no longer
+    matches the track's current chunks (re-analyzed / newly analyzed).
+    Only songs with at least *min_track_chunks* chunk vectors are
+    considered — fewer cannot be density-judged meaningfully.
+    """
+    current = noise_track_signatures(conn, dataset)
+    stored = {int(r["track_id"]): (int(r["n_chunks"]), int(r["chunk_sum"]))
+              for r in conn.execute(
+                  "SELECT track_id, n_chunks, chunk_sum FROM "
+                  "noise_run_tracks WHERE dataset = ? AND method = ?",
+                  (str(dataset), str(method))).fetchall()}
+    return sorted(track_id for track_id, sig in current.items()
+                  if sig[0] >= min_track_chunks and stored.get(track_id)
+                  != sig)
+
+
 def get_noise_filter(conn: sqlite3.Connection, dataset: str,
                      method: str) -> sqlite3.Row | None:
     """The stored noise-filter run for *dataset* + *method*, if any."""
@@ -865,6 +916,28 @@ def get_noise_filter(conn: sqlite3.Connection, dataset: str,
         "SELECT * FROM noise_filters WHERE dataset = ? AND method = ?",
         (str(dataset), str(method))).fetchone()
     return row
+
+
+def update_noise_filter_result(conn: sqlite3.Connection, filter_id: int,
+                               params: str, n_vectors: int,
+                               noise_chunk_ids) -> None:
+    """Replace the flag set of one stored filter row IN PLACE.
+
+    The incremental post-analysis path uses this: only the given chunk ids
+    change — other songs' flags in the same (dataset, method) filter stay
+    untouched.  ``n_noise`` is recomputed from the new set.
+    """
+    conn.execute(
+        "UPDATE noise_filters SET params = ?, n_vectors = ?, n_noise = ? "
+        "WHERE id = ?",
+        (str(params), int(n_vectors), len(set(noise_chunk_ids)),
+         int(filter_id)))
+    conn.execute("DELETE FROM noise_chunks WHERE filter_id = ?",
+                 (int(filter_id),))
+    conn.executemany(
+        "INSERT OR IGNORE INTO noise_chunks(filter_id, chunk_id) "
+        "VALUES (?, ?)",
+        [(int(filter_id), int(chunk_id)) for chunk_id in noise_chunk_ids])
 
 
 def list_noise_filters(conn: sqlite3.Connection) -> list[sqlite3.Row]:
